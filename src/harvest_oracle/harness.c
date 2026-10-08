@@ -411,6 +411,10 @@ static void handler(int signal, siginfo_t *info, void *context) {
       return;
     finish("crash", fault, NULL);
   }
+  // A non-canonical address faults as a general protection fault (SIGSEGV) through most base registers but as a
+  // stack segment fault (SIGBUS) through rsp or rbp; the kernel reports neither address, so they are one crash.
+  if (signal == SIGBUS && info->si_code == SI_KERNEL)
+    finish("crash", fault, NULL);
   finish(signal == SIGFPE ? "fpe" : signal == SIGILL ? "ill" : signal == SIGBUS ? "bus" : "signal", rip, NULL);
 }
 
