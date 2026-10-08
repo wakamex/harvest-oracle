@@ -71,7 +71,7 @@ harvest-oracle batch master=DIR_A branch=DIR_B original=image
   {"instruction": "0x4be2a1", "base": "this.0xe0", "offset": "0x20", "size": 8, "access": "read"}, ...]}}
 ```
 
-A forward dataflow over the function's code tracks which base each register holds: at entry `this` and the arguments in their argument registers, then through register copies, `lea` and constant offsets, spills to and reloads from stack slots, and loads of pointer fields, so an access through a pointer loaded from `this+0xe0` has base `this.0xe0`. Globals are named by the `symbols.tsv` symbol containing the address. A call clobbers the caller-saved registers, and where paths join with different bases a register holds none; accesses relative to the stack are left out.
+A forward dataflow over the function's code tracks which base each register holds: at entry `this` and the arguments in their argument registers, numbered by source parameter (a float parameter takes no integer register), then through register copies, `lea` and constant offsets, spills to and reloads from stack slots, and loads of pointer fields, so an access through a pointer loaded from `this+0xe0` has base `this.0xe0`. Globals are named by the `symbols.tsv` symbol containing the address. A call clobbers the caller-saved registers, and where paths join with different bases a register holds none; accesses relative to the stack are left out.
 
 ## rev.ng's C as a version
 

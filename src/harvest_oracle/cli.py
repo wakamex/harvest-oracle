@@ -84,8 +84,11 @@ def cmd_accesses(args):
             raise SystemExit(f"{symbol} has no address and size in {harvest.symbols}")
         start, size = harvest.known[symbol], harvest.sizes[symbol]
         [signature] = oracle.demangle([symbol])
-        names = (["this"] if not args.static and "(" in signature else []) + [
-            f"argument {i + 1}" for i in range(6)]
+        # Integer argument registers in order, named by source parameter: a float parameter takes none.
+        names = ["this"] if not args.static and "(" in signature else []
+        params = oracle.parameters(signature) if "(" in signature else []
+        names += [f"argument {i + 1}" for i, p in enumerate(params) if p not in ("float", "double")]
+        names += [f"argument {len(params) + i + 1}" for i in range(6)]
         result[f"0x{start:x}"] = {"symbol": symbol, "signature": signature,
                                   "accesses": accesses.analyze(harvest.image, start, start + size, names[:6],
                                                                globals_)}
