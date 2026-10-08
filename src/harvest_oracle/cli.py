@@ -20,7 +20,8 @@ def cmd_check(args):
                           static=args.static, arguments=args.arguments, out=args.keep)
     pair = report["comparison"]["a vs b"]
     line = {"symbol": args.symbol, "unit": args.unit, "verdict": "agree" if pair["differ"] == 0 else "differ",
-            "cases": report["cases"], "agree": pair["agree"], "differ": pair["differ"], "returns": report["returns"],
+            "cases": report["cases"], "agree": pair["agree"], "differ": pair["differ"],
+            "layout_dependent": pair["layout_dependent"], "returns": report["returns"],
             "distinct_behaviors": report["distinct_behaviors"]["a"],
             "first_difference": pair["examples"][0] if pair["examples"] else None}
     print(json.dumps(line))
@@ -56,7 +57,9 @@ def cmd_batch(args):
             continue
         out = args.keep / address if args.keep else None
         report = oracle.check(harvest, symbol, versions, cases=args.cases, returns=returns, out=out)
-        pairs = {k: f"{v['agree']}/{v['agree'] + v['differ']}" for k, v in report["comparison"].items()}
+        pairs = {k: f"{v['agree']}/{report['cases']}" + (f" ({v['layout_dependent']} layout-dependent)"
+                                                       if v["layout_dependent"] else "")
+                 for k, v in report["comparison"].items()}
         print(json.dumps({"address": address, "symbol": symbol, "outcomes": report["outcomes"][next(iter(versions))],
                           "pairs": pairs, "examples": {k: v["examples"][:1] for k, v in report["comparison"].items()}}))
         if any(v["differ"] for v in report["comparison"].values()):
@@ -72,7 +75,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
 
     def common(p):
-        p.add_argument("--cases", type=int, default=400, help="generated cases per version (default 400)")
+        p.add_argument("--cases", type=int, default=5000, help="generated cases per version (default 5000)")
         p.add_argument("--returns", choices=["auto", "none", "int", "bool", "float"], default="auto",
                        help="return type to compare; auto reads it from the declarations under src/")
         p.add_argument("--static", action="store_true", help="the function takes no this pointer")

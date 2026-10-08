@@ -190,7 +190,7 @@ def describe_callees(callees, signatures, pointee):
         pointee[name] = ([8] if is_member(head) else []) + [pointee_size(p) for p in params]
 
 
-def link(harvest, name, obj, function, out):
+def link(harvest, name, obj, function, out, pad=False):
     """Link OBJ alone so that FUNCTION is its only code that runs.
 
     Returns the linked executable, the function's address in it, the address of the named stubs' thunk slot,
@@ -234,8 +234,14 @@ def link(harvest, name, obj, function, out):
     (out / f"{name}-stubs.s").write_text("\n".join(assembly) + "\n")
     run(["as", "-o", str(out / f"{name}-stubs.o"), str(out / f"{name}-stubs.s")])
     elf, linker_map = out / f"{name}.elf", out / f"{name}.map"
+    padding = []
+    if pad:
+        # 4 KB ahead of the object's data, to tell behavior that depends on its own data layout.
+        (out / "pad.s").write_text(".section .rodata\n.zero 4096\n.data\n.zero 4096\n.bss\n.zero 4096\n")
+        run(["as", "-o", str(out / "pad.o"), str(out / "pad.s")])
+        padding = [str(out / "pad.o")]
     run(["ld", "-static", "-nostdlib", "-z", "noexecstack", f"-Ttext-segment=0x{BASE:x}", "-e", function, *defsyms,
-         "-Map", str(linker_map), str(obj), str(out / f"{name}-stubs.o"), "-o", str(elf)])
+         "-Map", str(linker_map), *padding, str(obj), str(out / f"{name}-stubs.o"), "-o", str(elf)])
     addresses = {}
     for line in run(["nm", str(elf)]).splitlines():
         parts = line.split()
@@ -288,15 +294,21 @@ def text_section(image):
     raise SystemExit(f"{image} has no .text section")
 
 
-def execute(harvest, elf, entry, slot, spec, cases, own=None):
-    """Run the harness. ELF is a linked version, or "-" with OWN = (start, size) to run the executable's own
-    code of the function in place."""
+def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None):
+    """Run the harness on seeds 1 to CASES, or on SEEDS. ELF is a linked version, or "-" with
+    OWN = (start, size) to run the executable's own code of the function in place."""
+    if seeds is not None:
+        return [r for seed in seeds for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed)]
+    return execute_range(harvest, elf, entry, slot, spec, cases, own)
+
+
+def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1):
     env = {"ORACLE_THUNK_SLOT": f"0x{slot:x}"} if slot else {}
     env["ORACLE_PLT"] = harvest.plt
     if own:
         text = text_section(harvest.image)
         env.update(ORACLE_IMAGE_FUNCTION=f"0x{own[0]:x}:{own[1]}", ORACLE_TEXT=f"0x{text[0]:x}:0x{text[1]:x}")
-    output = subprocess.run([str(harness_binary()), str(harvest.image), str(elf), f"0x{entry:x}", spec, "1",
+    output = subprocess.run([str(harness_binary()), str(harvest.image), str(elf), f"0x{entry:x}", spec, str(first),
                              str(cases)], check=True, capture_output=True, text=True, env=env).stdout
     return [json.loads(line) for line in output.splitlines()]
 
@@ -380,7 +392,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
     with tempfile.TemporaryDirectory() as scratch:
         directory = Path(out) if out else Path(scratch)
         directory.mkdir(parents=True, exist_ok=True)
-        results, stub_lists, ranges = {}, {}, {}
+        results, stub_lists, ranges, runners = {}, {}, {}, {}
         for name, obj in versions.items():
             if str(obj) == IMAGE:
                 # The executable's own code of the function, run in place: no object, no delinking.
@@ -392,23 +404,41 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
                 results[name] = execute(harvest, elf, entry, slot, spec, cases)
+                # The same version with its own data 4 KB further on, for the layout check.
+                padded = directory / "padded"
+                padded.mkdir(exist_ok=True)
+                runners[name] = (padded, Path(obj))
             stub_lists[name] = stubs
             describe_callees(stubs, signatures, pointee)
             if out:
                 (directory / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results[name]))
-    reference, *others = list(results)
+
+        def differs(a, b, ra, rb):
+            return case_differences(a, b, ra, rb, harvest.names, signatures, pointee, return_kind)
+
+        reference, *others = list(results)
+        differing = {other: [i for i, (a, b) in enumerate(zip(results[reference], results[other]))
+                             if differs(a, b, ranges[reference], ranges[other])] for other in others}
+        # Layout check: a differing case that some version answers differently once its own data moves depends
+        # on that layout (an out-of-range index into a static table, a value derived from an address), not on
+        # what the code does, and is reported apart from the differences.
+        layout_dependent = set()
+        suspects = sorted({i for indices in differing.values() for i in indices})
+        for name, (padded, obj) in runners.items() if suspects else ():
+            elf, entry, slot, _, padded_ranges = link(harvest, name, obj, function, padded, pad=True)
+            moved = execute(harvest, elf, entry, slot, spec, None, seeds=[i + 1 for i in suspects])
+            for i, again in zip(suspects, moved):
+                if differs(results[name][i], again, ranges[name], padded_ranges):
+                    layout_dependent.add(i)
     comparison = {}
     for other in others:
-        agree, examples = 0, []
-        for a, b in zip(results[reference], results[other]):
-            diffs = case_differences(a, b, ranges[reference], ranges[other], harvest.names, signatures, pointee,
-                                     return_kind)
-            if diffs:
-                if len(examples) < 5:
-                    examples.append({"seed": a["seed"], "differences": diffs})
-            else:
-                agree += 1
-        comparison[f"{reference} vs {other}"] = {"agree": agree, "differ": cases - agree, "examples": examples}
+        real = [i for i in differing[other] if i not in layout_dependent]
+        examples = [{"seed": results[reference][i]["seed"],
+                     "differences": differs(results[reference][i], results[other][i], ranges[reference],
+                                            ranges[other])} for i in real[:5]]
+        comparison[f"{reference} vs {other}"] = {
+            "agree": cases - len(differing[other]), "differ": len(real),
+            "layout_dependent": len(differing[other]) - len(real), "examples": examples}
     outcomes = {n: {} for n in results}
     for n, rs in results.items():
         for r in rs:

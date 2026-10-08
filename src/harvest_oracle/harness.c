@@ -112,11 +112,26 @@ static uint64_t region_pointer(uint64_t h) {
 
 // The generated value of a word: pointers into the region most often, then small integers, zero,
 // float and double bit patterns (NaN and the infinities included) and arbitrary words.
+// Float bit patterns for words whose both halves are floats, NaN-heavy: a comparison rewritten so that it
+// differs only on NaN needs a NaN in the field it reads.
+static const uint32_t special_floats[] = {
+  0x7fc00000, 0xffc00000, 0x7fc00001, 0xffffffff, 0x7f800000, 0xff800000, 0x00000000, 0x80000000,
+  0x3f800000, 0xbf800000, 0x00000001, 0x7f7fffff, 0x41200000, 0xc2c80000, 0x3dcccccd, 0x447a0000,
+};
+
 static uint64_t word(uint64_t h) {
-  // Three seeds in four follow pointers: pointers and zero (which ends lists and trees) only.
-  if (seed & 3) {
+  // Half the seeds follow pointers: pointers and zero (which ends lists and trees) only.
+  if ((seed & 3) == 1 || (seed & 3) == 2) {
     if ((h & 15) < 13)
       return region_pointer(h);
+    return (h & 15) == 15 ? 1 : 0;
+  }
+  // A quarter mix pointers with words of two floats, so float fields at either half of a word see NaN.
+  if ((seed & 3) == 3) {
+    if ((h & 15) < 10)
+      return region_pointer(h);
+    if ((h & 15) < 14)
+      return ((uint64_t)special_floats[(h >> 8) & 15] << 32) | special_floats[(h >> 12) & 15];
     return (h & 15) == 15 ? 1 : 0;
   }
   switch (h & 15) {
@@ -488,19 +503,24 @@ __asm__(".text\n"
         "  lea -40(%rbp), %rsp; pop %r15; pop %r14; pop %r13; pop %r12; pop %rbx; pop %rbp; ret\n"
         ".globl oracle_thunk\n"
         "oracle_thunk:\n"
+        "  mov %rsp, oracle_thunk_saved_rsp(%rip); lea oracle_thunk_stack+65536(%rip), %rsp\n"
         "  push %rbp; mov %rsp, %rbp; sub $176, %rsp; and $-16, %rsp\n"
         "  mov %rdi, 0(%rsp); mov %rsi, 8(%rsp); mov %rdx, 16(%rsp); mov %rcx, 24(%rsp); mov %r8, 32(%rsp)\n"
         "  mov %r9, 40(%rsp); movq %xmm0, 48(%rsp); movq %xmm1, 56(%rsp); movq %xmm2, 64(%rsp); movq %xmm3, 72(%rsp)\n"
         "  movq %xmm4, 80(%rsp); movq %xmm5, 88(%rsp); movq %xmm6, 96(%rsp); movq %xmm7, 104(%rsp); mov %rax, 112(%rsp)\n"
-        "  mov 8(%rbp), %r10; mov %r10, 120(%rsp)\n"
+        "  mov oracle_thunk_saved_rsp(%rip), %r10; mov (%r10), %r10; mov %r10, 120(%rsp)\n"
         "  mov %r11, %rdi; mov %rsp, %rsi; lea 128(%rsp), %rdx\n"
         "  call oracle_stub\n"
         "  mov 128(%rsp), %rax; mov 136(%rsp), %rdx; movq 144(%rsp), %xmm0; movq 152(%rsp), %xmm1\n"
         "  movabs $0x0badc0de0badc0de, %rdi; mov %rdi, %rsi; mov %rdi, %rcx; mov %rdi, %r8; mov %rdi, %r9\n"
         "  movq %rdi, %xmm2; movq %rdi, %xmm3; movq %rdi, %xmm4; movq %rdi, %xmm5; movq %rdi, %xmm6; movq %rdi, %xmm7\n"
-        "  leave; ret\n");
+        "  leave; mov oracle_thunk_saved_rsp(%rip), %rsp; ret\n");
 void oracle_call(uint64_t entry, const struct regs *regs, struct result *result);
 uint64_t oracle_saved_rsp;
+// The thunk runs the stub handler on its own stack: below the function's stack pointer it would leave the
+// harness's return addresses, which differ between processes, where the function may later read them.
+uint64_t oracle_thunk_saved_rsp;
+char oracle_thunk_stack[65536] __attribute__((aligned(16)));
 void oracle_thunk(void);
 
 int main(int argc, char **argv) {
