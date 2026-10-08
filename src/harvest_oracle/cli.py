@@ -21,7 +21,7 @@ def cmd_check(args):
     pair = report["comparison"]["a vs b"]
     line = {"symbol": args.symbol, "unit": args.unit, "verdict": "agree" if pair["differ"] == 0 else "differ",
             "cases": report["cases"], "agree": pair["agree"], "differ": pair["differ"],
-            "layout_dependent": pair["layout_dependent"], "returns": report["returns"],
+            "layout_dependent": pair["layout_dependent"], "undefined": pair["undefined"], "returns": report["returns"],
             "distinct_behaviors": report["distinct_behaviors"]["a"],
             "first_difference": pair["examples"][0] if pair["examples"] else None}
     print(json.dumps(line))
@@ -57,8 +57,8 @@ def cmd_batch(args):
             continue
         out = args.keep / address if args.keep else None
         report = oracle.check(harvest, symbol, versions, cases=args.cases, returns=returns, out=out)
-        pairs = {k: f"{v['agree']}/{report['cases']}" + (f" ({v['layout_dependent']} layout-dependent)"
-                                                       if v["layout_dependent"] else "")
+        pairs = {k: f"{v['agree']}/{report['cases']}" + "".join(
+                     f" ({v[key]} {key.replace('_', '-')})" for key in ("layout_dependent", "undefined") if v[key])
                  for k, v in report["comparison"].items()}
         print(json.dumps({"address": address, "symbol": symbol, "outcomes": report["outcomes"][next(iter(versions))],
                           "pairs": pairs, "examples": {k: v["examples"][:1] for k, v in report["comparison"].items()}}))

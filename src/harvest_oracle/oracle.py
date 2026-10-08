@@ -285,6 +285,41 @@ def normalized_writes(writes, ranges):
     return result
 
 
+# ucontext register numbers of the general-purpose registers, by 64-bit and 32-bit name.
+UCONTEXT_REGISTERS = {"r8": 0, "r9": 1, "r10": 2, "r11": 3, "r12": 4, "r13": 5, "r14": 6, "r15": 7, "rdi": 8,
+                      "rsi": 9, "rbp": 10, "rbx": 11, "rdx": 12, "rax": 13, "rcx": 14, "rsp": 15}
+UCONTEXT_REGISTERS.update({"e" + n[1:] if n[0] == "r" and n[1:].isalpha() else n + "d": v
+                           for n, v in list(UCONTEXT_REGISTERS.items())})
+
+
+def guards(elf, function):
+    """Indexed reads of the version's own sized data in FUNCTION: instructions addressing disp(base,index,scale)
+    whose displacement falls inside a sized data symbol, with that symbol's extent."""
+    symbols = []
+    for line in run(["nm", "-S", str(elf)]).splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[2] in "rRdDbB":
+            symbols.append((int(parts[0], 16), int(parts[0], 16) + int(parts[1], 16)))
+    listing = run(["objdump", "-d", "--no-show-raw-insn", str(elf)])
+    body = listing.split(f"<{function}>:\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    instructions = [(int(m.group(1), 16), m.group(2)) for m in
+                    (re.match(r"\s*([0-9a-f]+):\s+(.*)", line) for line in body) if m]
+    result = []
+    for (address, text), (following, _) in zip(instructions, instructions[1:] + [(None, None)]):
+        m = re.search(r"(-?0x[0-9a-f]+)\((?:%(\w+))?,%(\w+),([1248])\)", text)
+        if not m:
+            continue
+        displacement = int(m.group(1), 16) & 0xFFFFFFFFFFFFFFFF
+        extent = next(((a, b) for a, b in symbols if a <= displacement < b), None)
+        if not extent or m.group(3) not in UCONTEXT_REGISTERS:
+            continue
+        base = UCONTEXT_REGISTERS.get(m.group(2), -1) if m.group(2) else -1
+        wide = int(m.group(3).startswith("r"))
+        result.append(f"{address:x}:{displacement:x}:{extent[0]:x}:{extent[1]:x}:{base}:"
+                      f"{UCONTEXT_REGISTERS[m.group(3)]}:{m.group(4)}:{wide}")
+    return ",".join(result)
+
+
 def text_section(image):
     """The executable's .text section as (start, end)."""
     for line in run(["readelf", "-SW", str(image)]).splitlines():
@@ -294,17 +329,20 @@ def text_section(image):
     raise SystemExit(f"{image} has no .text section")
 
 
-def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None):
+def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_list=""):
     """Run the harness on seeds 1 to CASES, or on SEEDS. ELF is a linked version, or "-" with
     OWN = (start, size) to run the executable's own code of the function in place."""
     if seeds is not None:
-        return [r for seed in seeds for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed)]
-    return execute_range(harvest, elf, entry, slot, spec, cases, own)
+        return [r for seed in seeds
+                for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed, guard_list=guard_list)]
+    return execute_range(harvest, elf, entry, slot, spec, cases, own, guard_list=guard_list)
 
 
-def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1):
+def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list=""):
     env = {"ORACLE_THUNK_SLOT": f"0x{slot:x}"} if slot else {}
     env["ORACLE_PLT"] = harvest.plt
+    if guard_list:
+        env["ORACLE_GUARDS"] = guard_list
     if own:
         text = text_section(harvest.image)
         env.update(ORACLE_IMAGE_FUNCTION=f"0x{own[0]:x}:{own[1]}", ORACLE_TEXT=f"0x{text[0]:x}:0x{text[1]:x}")
@@ -403,7 +441,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                 results[name] = execute(harvest, "-", start, None, spec, cases, own=(start, size))
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
-                results[name] = execute(harvest, elf, entry, slot, spec, cases)
+                results[name] = execute(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf, function))
                 # The same version with its own data 4 KB further on, for the layout check.
                 padded = directory / "padded"
                 padded.mkdir(exist_ok=True)
@@ -417,8 +455,12 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             return case_differences(a, b, ra, rb, harvest.names, signatures, pointee, return_kind)
 
         reference, *others = list(results)
+        # A case in which any version reads past a static table it indexes is undefined: what lies past the
+        # table depends on each build's data layout.
+        undefined = {i for rs in results.values() for i, r in enumerate(rs) if r["outcome"] == "undefined"}
         differing = {other: [i for i, (a, b) in enumerate(zip(results[reference], results[other]))
-                             if differs(a, b, ranges[reference], ranges[other])] for other in others}
+                             if i not in undefined and differs(a, b, ranges[reference], ranges[other])]
+                     for other in others}
         # Layout check: a differing case that some version answers differently once its own data moves depends
         # on that layout (an out-of-range index into a static table, a value derived from an address), not on
         # what the code does, and is reported apart from the differences.
@@ -426,7 +468,8 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         suspects = sorted({i for indices in differing.values() for i in indices})
         for name, (padded, obj) in runners.items() if suspects else ():
             elf, entry, slot, _, padded_ranges = link(harvest, name, obj, function, padded, pad=True)
-            moved = execute(harvest, elf, entry, slot, spec, None, seeds=[i + 1 for i in suspects])
+            moved = execute(harvest, elf, entry, slot, spec, None, seeds=[i + 1 for i in suspects],
+                            guard_list=guards(elf, function))
             for i, again in zip(suspects, moved):
                 if differs(results[name][i], again, ranges[name], padded_ranges):
                     layout_dependent.add(i)
@@ -437,8 +480,8 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                      "differences": differs(results[reference][i], results[other][i], ranges[reference],
                                             ranges[other])} for i in real[:5]]
         comparison[f"{reference} vs {other}"] = {
-            "agree": cases - len(differing[other]), "differ": len(real),
-            "layout_dependent": len(differing[other]) - len(real), "examples": examples}
+            "agree": cases - len(differing[other]) - len(undefined), "differ": len(real),
+            "layout_dependent": len(differing[other]) - len(real), "undefined": len(undefined), "examples": examples}
     outcomes = {n: {} for n in results}
     for n, rs in results.items():
         for r in rs:

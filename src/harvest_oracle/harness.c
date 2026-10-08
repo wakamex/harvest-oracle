@@ -327,12 +327,61 @@ static void emulate_call(ucontext_t *uc, uint64_t target) {
   }
 }
 
+// Indexed reads of a version's own sized data, from ORACLE_GUARDS: each guarded instruction starts with int3,
+// and a read outside the indexed symbol's extent ends the case as undefined, since what lies past a static
+// table depends on each build's data layout. An in-bounds read runs the original instruction by single step.
+#define MAX_GUARDS 256
+struct guard {
+  uint64_t insn, disp, start, end;
+  int base, index, scale, wide;  // ucontext register numbers, -1 for none; wide: 64-bit registers
+  unsigned char original;
+};
+static struct guard guards[MAX_GUARDS];
+static int guard_count, stepping = -1;
+
+static void set_byte(uint64_t address, unsigned char value) {
+  uint64_t page = address & ~(PAGE - 1);
+  mprotect((void *)page, PAGE, PROT_READ | PROT_WRITE);
+  *(unsigned char *)address = value;
+  mprotect((void *)page, PAGE, PROT_READ | PROT_EXEC);
+}
+
+static int guard_trap(ucontext_t *uc) {
+  greg_t *g = uc->uc_mcontext.gregs;
+  if (stepping >= 0) {
+    // The original instruction has run: guard it again.
+    set_byte(guards[stepping].insn, 0xcc);
+    g[REG_EFL] &= ~0x100;
+    stepping = -1;
+    return 1;
+  }
+  for (int i = 0; i < guard_count; i++) {
+    struct guard *q = &guards[i];
+    if ((uint64_t)g[REG_RIP] - 1 != q->insn)
+      continue;
+    uint64_t index = g[q->index], base = q->base >= 0 ? (uint64_t)g[q->base] : 0;
+    if (!q->wide)
+      index &= 0xffffffff, base &= 0xffffffff;
+    uint64_t address = q->disp + base + index * q->scale;
+    if (address < q->start || address >= q->end)
+      finish("undefined", address, NULL);
+    set_byte(q->insn, q->original);
+    g[REG_RIP] = q->insn;
+    g[REG_EFL] |= 0x100;
+    stepping = i;
+    return 1;
+  }
+  return 0;
+}
+
 static void handler(int signal, siginfo_t *info, void *context) {
   ucontext_t *uc = context;
   greg_t *g = uc->uc_mcontext.gregs;
   uint64_t rip = g[REG_RIP], fault = (uint64_t)info->si_addr;
   if (signal == SIGALRM)
     finish("timeout", rip, NULL);
+  if (signal == SIGTRAP && guard_trap(uc))
+    return;
   // A call or jump out of the image function under test lands on the int3 filling the rest of its pages.
   if (signal == SIGTRAP && own_end && rip - 1 >= text_start && rip - 1 < text_end &&
       (rip - 1 < own_start || rip - 1 >= own_end)) {
@@ -543,6 +592,17 @@ int main(int argc, char **argv) {
     *name++ = 0;
     plt_address[plt_count] = strtoull(entry, NULL, 0);
     plt_name[plt_count++] = name;
+  }
+  char *guard_list = getenv("ORACLE_GUARDS");
+  for (char *entry = guard_list ? strtok(guard_list, ",") : NULL; entry && guard_count < MAX_GUARDS;
+       entry = strtok(NULL, ",")) {
+    struct guard *q = &guards[guard_count];
+    if (sscanf(entry, "%lx:%lx:%lx:%lx:%d:%d:%d:%d", &q->insn, &q->disp, &q->start, &q->end, &q->base, &q->index,
+               &q->scale, &q->wide) != 8)
+      continue;
+    q->original = *(unsigned char *)q->insn;
+    set_byte(q->insn, 0xcc);
+    guard_count++;
   }
   const char *own = getenv("ORACLE_IMAGE_FUNCTION"), *text = getenv("ORACLE_TEXT");
   if (own && text) {

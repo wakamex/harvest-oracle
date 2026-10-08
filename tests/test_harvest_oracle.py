@@ -43,6 +43,16 @@ int update(struct item *item, float delta) {
 
 UPDATE = "_Z6updateP4itemf"
 
+# A function that indexes a static table with an integer it is given: a generated index is almost always out of
+# range, and what lies past the table depends on the build.
+TABLE = r"""
+static const float factors[] = {0.0f, 0.5f, 1.0f, 2.0f};
+static const char other[] = "data after the table";
+const char *keep = other;
+float scaled(float value, int index) { return value * factors[index]; }
+"""
+SCALED = "_Z6scaledfi"
+
 
 def run(command, **kwargs):
     return subprocess.run(command, check=True, capture_output=True, text=True, **kwargs).stdout
@@ -94,6 +104,18 @@ class SyntheticCheckout(unittest.TestCase):
         report = oracle.check(oracle.Harvest(self.root, "test"), UPDATE, {"a": self.objects["o2"], "b": "image"},
                               cases=200, returns="int", static=True)
         self.assertEqual(report["comparison"]["a vs b"]["differ"], 0)
+
+    def test_reads_past_a_static_table_are_undefined(self):
+        path = self.root / "table.cpp"
+        path.write_text(TABLE)
+        run(["g++", "-O2", "-fno-pic", "-c", "-o", str(self.root / "table.o"), str(path)])
+        report = oracle.check(oracle.Harvest(self.root, "test"), SCALED,
+                              {"a": self.root / "table.o", "b": self.root / "table.o"}, cases=200, returns="float",
+                              static=True)
+        pair = report["comparison"]["a vs b"]
+        self.assertGreater(pair["undefined"], 0)
+        self.assertEqual(pair["differ"], 0)
+        self.assertEqual(pair["agree"] + pair["undefined"], 200)
 
     def test_check_command_prints_one_line(self):
         output = run([sys.executable, "-m", "harvest_oracle", "--harvest", str(self.root), "--build", "test", "check",

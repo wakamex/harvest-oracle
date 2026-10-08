@@ -21,6 +21,8 @@ For each case:
 
 Calls without a known signature, such as virtual calls, compare `rdi`, `rsi` and `xmm0` to `xmm3`, skipping any register that still holds the poison in either version. An argument that points into the stack, into the version's own data or into the executable's read-only data is compared by the bytes it points at, up to the size of its parameter type. A pointer into a version's own copy of executable data (a section named after a symbol of the executable, such as `.rodata._ZTV...`) is translated to the executable's address before comparing. Writes are not compared for cases that fault, since which stores precede a faulting load depends on instruction scheduling.
 
+Every instruction of the function that indexes a sized data symbol of the version's own, such as `mulss TABLE(,%rax,4)` on a static table, is guarded: the harness computes the address it reads, and a read outside the symbol's extent ends the case as undefined. Such a case is left out of the comparison, since what lies past a static table depends on each build's data layout. In-bounds reads run unchanged.
+
 A case that differs is run again with each linked version's own data placed 4 KB further on. If a version then disagrees with itself, the case depends on that version's data layout, for example an out-of-range index into a static table or a value derived from an address, and it is reported as layout-dependent instead of as a difference.
 
 Delinked target objects can also be checked as objects. They need two more bindings, both by the label's name: `lbl_<address>` is bound to that address in the executable, and `sub_<address>` inside the function under test to the same offset in the linked copy. Prefer `image` for the original code: a delinked object can resolve a reference to the wrong data, such as a wide string literal to a narrow one in a merged string section, which the linker then shortens.
@@ -41,7 +43,7 @@ Check two objects' versions of one function; one JSON line, exit status 0 when t
 
 ```
 harvest-oracle check build/master/X.o build/match/1.18-linux-amd64/X.o --symbol _ZN5daisy14CIrrDeviceStub29getAcceptsDragAndDropFileTypeEPKc
-{"symbol": "...", "unit": null, "verdict": "agree", "cases": 5000, "agree": 5000, "differ": 0, "layout_dependent": 0, "returns": "bool", "distinct_behaviors": 341, "first_difference": null}
+{"symbol": "...", "unit": null, "verdict": "agree", "cases": 5000, "agree": 5000, "differ": 0, "layout_dependent": 0, "undefined": 0, "returns": "bool", "distinct_behaviors": 341, "first_difference": null}
 ```
 
 Compare any number of versions of a function, the first being the reference, and keep the per-case records:
