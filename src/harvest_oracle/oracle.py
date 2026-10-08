@@ -67,6 +67,9 @@ class Harvest:
             self.sizes[name] = int(size)
         self.names = {address: name for name, address in self.known.items()}
         self._plt = None
+        # Start addresses of the executable's loadable segments, in order: rev.ng's segment_N.
+        self.segments = [int(m.group(1), 16) for m in re.finditer(r"LOAD\s+0x\w+\s+(0x\w+)",
+                                                                   run(["readelf", "-lW", str(self.image)]))]
 
     @property
     def plt(self):
@@ -196,22 +199,34 @@ def link(harvest, name, obj, function, out, pad=False):
     Returns the linked executable, the function's address in it, the address of the named stubs' thunk slot,
     the named stubs and the ranges of the version's own copies of executable data."""
     known = harvest.known
-    defined, undefined = set(), set()
+    defined, undefined, data = set(), set(), set()
     for line in run(["nm", str(obj)]).splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] == "U":
             undefined.add(parts[1])
-        elif len(parts) == 3 and parts[1] in "TWVDBRGS" and parts[1].isupper():
+        elif len(parts) == 3 and parts[1] in "TWVDBRGSC" and parts[1].isupper():
             defined.add(parts[2])
+            if parts[1] in "DBRGSC":
+                data.add(parts[2])
     if function not in defined:
         raise SystemExit(f"{obj} does not define {function}")
+    # An object built from a decompiler's C (revng.py) defines adapters under its callees' names, which must stay
+    # its own; what it leaves undefined, and its data (rev.ng's header defines segment_N and globals tentatively),
+    # is bound to the executable.
+    decompiled = "oracle_native_slot" in defined
+    segments = harvest.segments
 
     def inside(address):
         return function in known and known[function] <= address < known[function] + harvest.sizes.get(function, 0)
 
     defsyms, stubs, blobs = [], [], []
-    for symbol in sorted((defined | undefined) - {function}):
-        if symbol in known:
+    for symbol in sorted(((undefined | data if decompiled else defined | undefined)) - {function}):
+        segment = re.fullmatch(r"segment_(\d+)", symbol)
+        if segment and int(segment.group(1)) < len(segments):
+            defsyms.append(f"--defsym={symbol}=0x{segments[int(segment.group(1))]:x}")
+        elif re.fullmatch(r"function_0x[0-9a-f]+_Code_x86_64", symbol):
+            defsyms.append(f"--defsym={symbol}=0x{symbol[11:-12]}")
+        elif symbol in known:
             defsyms.append(f"--defsym={symbol}=0x{known[symbol]:x}")
         elif re.fullmatch(r"sub_[0-9a-f]+", symbol) and inside(int(symbol[4:], 16)):
             # A delinker label inside the function under test, such as a jump table entry: the same offset
@@ -247,7 +262,8 @@ def link(harvest, name, obj, function, out, pad=False):
         parts = line.split()
         if len(parts) == 3:
             addresses[parts[2]] = int(parts[0], 16)
-    return elf, addresses[function], addresses["oracle_thunk_slot"], stubs, translations(linker_map, known)
+    native = addresses.get("oracle_native_slot")
+    return elf, addresses[function], (addresses["oracle_thunk_slot"], native), stubs, translations(linker_map, known)
 
 
 def translations(linker_map, known):
@@ -339,7 +355,10 @@ def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_
 
 
 def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list=""):
-    env = {"ORACLE_THUNK_SLOT": f"0x{slot:x}"} if slot else {}
+    thunk, native = slot if isinstance(slot, tuple) else (slot, None)
+    env = {"ORACLE_THUNK_SLOT": f"0x{thunk:x}"} if thunk else {}
+    if native:
+        env["ORACLE_NATIVE_SLOT"] = f"0x{native:x}"
     env["ORACLE_PLT"] = harvest.plt
     if guard_list:
         env["ORACLE_GUARDS"] = guard_list
@@ -469,6 +488,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
     return_kind = harvest.return_kind(signature) if returns == "auto" and "(" in signature else returns
     signatures, pointee = {}, {}
     describe_callees(list(harvest.known), signatures, pointee)
+    describe_callees([entry.split("=", 1)[1] for entry in harvest.plt.split(",") if "=" in entry], signatures, pointee)
     with tempfile.TemporaryDirectory() as scratch:
         directory = Path(out) if out else Path(scratch)
         directory.mkdir(parents=True, exist_ok=True)
@@ -485,9 +505,9 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
                 results[name] = execute(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf, function))
-                size = next(int(line.split()[1], 16) for line in run(["nm", "-S", str(elf)]).splitlines()
-                            if line.split()[-1] == function and len(line.split()) == 4)
-                setups[name] = integer_setups(elf, entry, entry + size)
+                size = next((int(line.split()[1], 16) for line in run(["nm", "-S", str(elf)]).splitlines()
+                             if line.split()[-1] == function and len(line.split()) == 4), None)
+                setups[name] = integer_setups(elf, entry, entry + size) if size else {}
                 # The same version with its own data 4 KB further on, for the layout check.
                 padded = directory / "padded"
                 padded.mkdir(exist_ok=True)

@@ -7,7 +7,7 @@ import sys
 from importlib import resources
 from pathlib import Path
 
-from . import explain, oracle
+from . import explain, oracle, revng
 
 
 def harvest_from(args):
@@ -67,6 +67,14 @@ def cmd_batch(args):
     return status
 
 
+def cmd_revng_object(args):
+    harvest = harvest_from(args)
+    plt = {entry.split("=", 1)[1]: int(entry.split("=", 1)[0], 16) for entry in harvest.plt.split(",") if "=" in entry}
+    print(revng.build(args.plain, args.header, args.include, int(args.address, 16), args.symbol, harvest.known, plt,
+                      args.out))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="harvest-oracle", description=__doc__)
     parser.add_argument("--harvest", type=Path, default=Path(os.environ.get("HARVEST_ROOT", ".")),
@@ -105,6 +113,15 @@ def main(argv=None):
     p.add_argument("--only", nargs="*", help="addresses to run")
     common(p)
     p.set_defaults(run=cmd_batch)
+
+    p = sub.add_parser("revng-object", help="build a version object of one function from rev.ng's C")
+    p.add_argument("plain", type=Path, help="rev.ng's emit-c output converted with `revng ptml --plain`")
+    p.add_argument("header", type=Path, help="rev.ng's types-and-globals.h, with helpers.h beside it")
+    p.add_argument("include", type=Path, help="rev.ng's share/revng/include directory")
+    p.add_argument("address", help="the function's entry address")
+    p.add_argument("symbol", help="its mangled name, which the object defines")
+    p.add_argument("--out", type=Path, default=Path("revng-build"))
+    p.set_defaults(run=cmd_revng_object)
 
     p = sub.add_parser("explain", help="show how two versions differ on one case of a kept run")
     p.add_argument("directory", type=Path)

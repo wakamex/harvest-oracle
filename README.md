@@ -61,6 +61,12 @@ harvest-oracle batch master=DIR_A branch=DIR_B original=image
 
 `--cases` sets the number of generated cases (default 5000; a comparison changed to differ only on NaN, deep in a function, can differ in as few as 1 case in 500), `--returns` overrides the return type, `--static` marks a function without a `this` pointer, and `--arguments` gives the argument kinds of a function without a mangled parameter list.
 
+## rev.ng's C as a version
+
+`harvest-oracle revng-object` builds a version object from [rev.ng](https://rev.ng)'s C of one function. rev.ng writes a function with a register-based prototype as C whose parameters name registers (`_REG(rcx_x86_64)`), so the object wraps it: an entry under the function's mangled name passes each native argument register to the parameter that names it, every callee with such a prototype becomes an adapter that puts its arguments back in their registers before the call is recorded, and rev.ng's helpers and wide-integer runtime are linked in. Segments and globals bind to the executable.
+
+Two limits apply. A call through a function pointer with a register-based prototype, such as most virtual calls, still passes its arguments in the C calling convention's registers. And rev.ng's C drops the `fs` segment base, so the stack-protector load `%fs:0x28` reads address 0x28 and any function with a canary faults.
+
 ## Limitations
 
 Generated memory has no types, so many cases fault after a few pointer hops; a faulting case still compares the calls before the fault and the fault address, but code deep in a function is exercised less often than code near its start. Arguments of calls without a known signature are compared on a fixed set of registers, and a register a callee ignores can hold a leftover value that differs between versions. A version's own data that is not named after a symbol of the executable, such as merged string literals, is compared by content only when a pointer to it is passed as an argument.

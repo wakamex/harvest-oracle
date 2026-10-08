@@ -294,6 +294,18 @@ static const char *plt_lookup(uint64_t address) {
   return NULL;
 }
 
+// A call made by a decompiler's C through an adapter that has put its arguments back in their native registers:
+// recorded and answered exactly as a native call to TARGET.
+void oracle_native_c(uint64_t target, struct regs *regs, struct result *r) {
+  const char *import = plt_lookup(target);
+  if (import) {
+    oracle_stub(import, regs, r);
+  } else {
+    record(target, NULL, regs);
+    return_values(r);
+  }
+}
+
 // Record a call to TARGET at the faulting context and return from it with generated values.
 static void emulate_call(ucontext_t *uc, uint64_t target) {
   greg_t *g = uc->uc_mcontext.gregs;
@@ -551,6 +563,11 @@ __asm__(".text\n"
         "  mov %rsp, %rbp; add $40, %rbp\n"
         "  mov %rax, 0(%r10); mov %rdx, 8(%r10); movq %xmm0, 16(%r10); movq %xmm1, 24(%r10)\n"
         "  lea -40(%rbp), %rsp; pop %r15; pop %r14; pop %r13; pop %r12; pop %rbx; pop %rbp; ret\n"
+        ".globl oracle_native\n"
+        "oracle_native:\n"
+        "  mov %rsp, oracle_thunk_saved_rsp(%rip); lea oracle_thunk_stack+65536(%rip), %rsp\n"
+        "  call oracle_native_c\n"
+        "  mov oracle_thunk_saved_rsp(%rip), %rsp; ret\n"
         ".globl oracle_thunk\n"
         "oracle_thunk:\n"
         "  mov %rsp, oracle_thunk_saved_rsp(%rip); lea oracle_thunk_stack+65536(%rip), %rsp\n"
@@ -572,6 +589,7 @@ uint64_t oracle_saved_rsp;
 uint64_t oracle_thunk_saved_rsp;
 char oracle_thunk_stack[65536] __attribute__((aligned(16)));
 void oracle_thunk(void);
+void oracle_native(void);
 
 int main(int argc, char **argv) {
   if (argc != 7)
@@ -623,6 +641,10 @@ int main(int argc, char **argv) {
   const char *slot = getenv("ORACLE_THUNK_SLOT");
   if (slot)
     *(uint64_t *)strtoull(slot, NULL, 0) = (uint64_t)oracle_thunk;
+  // Adapters of a decompiler's C call oracle_native through oracle_native_slot.
+  const char *native = getenv("ORACLE_NATIVE_SLOT");
+  if (native)
+    *(uint64_t *)strtoull(native, NULL, 0) = (uint64_t)oracle_native;
 
   if (mmap((void *)STACK_BASE, STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1,
            0) != (void *)STACK_BASE)
