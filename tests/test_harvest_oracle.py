@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harvest_oracle import oracle
+from harvest_oracle import accesses, oracle
 from harvest_oracle.cli import main
 
 EXECUTABLE = r"""
@@ -116,6 +116,17 @@ class SyntheticCheckout(unittest.TestCase):
         self.assertGreater(pair["undefined"], 0)
         self.assertEqual(pair["differ"], 0)
         self.assertEqual(pair["agree"] + pair["undefined"], 200)
+
+    def test_accesses_name_struct_fields_by_argument(self):
+        harvest = oracle.Harvest(self.root, "test")
+        start, size = harvest.known[UPDATE], harvest.sizes[UPDATE]
+        globals_ = sorted((a, a + harvest.sizes.get(n, 0), n) for n, a in harvest.known.items())
+        found = {(a["base"], a["offset"], a["size"], a["access"])
+                 for a in accesses.analyze(harvest.image, start, start + size, ["argument 1"], globals_)}
+        self.assertIn(("argument 1", "0x4", 4, "read"), found)  # item->weight
+        self.assertIn(("argument 1", "0x0", 4, "write"), found)  # item->value
+        self.assertIn(("argument 1", "0x8", 8, "read"), found)  # item->next
+        self.assertIn(("scale", "0x0", 4, "read"), found)
 
     def test_check_command_prints_one_line(self):
         output = run([sys.executable, "-m", "harvest_oracle", "--harvest", str(self.root), "--build", "test", "check",

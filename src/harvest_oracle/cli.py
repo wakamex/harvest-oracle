@@ -7,7 +7,7 @@ import sys
 from importlib import resources
 from pathlib import Path
 
-from . import explain, oracle, revng
+from . import accesses, explain, oracle, revng
 
 
 def harvest_from(args):
@@ -75,6 +75,24 @@ def cmd_revng_object(args):
     return 0
 
 
+def cmd_accesses(args):
+    harvest = harvest_from(args)
+    result = {}
+    globals_ = sorted((address, address + harvest.sizes.get(name, 0), name) for name, address in harvest.known.items())
+    for symbol in args.symbols:
+        if symbol not in harvest.known or not harvest.sizes.get(symbol):
+            raise SystemExit(f"{symbol} has no address and size in {harvest.symbols}")
+        start, size = harvest.known[symbol], harvest.sizes[symbol]
+        [signature] = oracle.demangle([symbol])
+        names = (["this"] if not args.static and "(" in signature else []) + [
+            f"argument {i + 1}" for i in range(6)]
+        result[f"0x{start:x}"] = {"symbol": symbol, "signature": signature,
+                                  "accesses": accesses.analyze(harvest.image, start, start + size, names[:6],
+                                                               globals_)}
+    print(json.dumps(result, indent=1))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="harvest-oracle", description=__doc__)
     parser.add_argument("--harvest", type=Path, default=Path(os.environ.get("HARVEST_ROOT", ".")),
@@ -113,6 +131,11 @@ def main(argv=None):
     p.add_argument("--only", nargs="*", help="addresses to run")
     common(p)
     p.set_defaults(run=cmd_batch)
+
+    p = sub.add_parser("accesses", help="the memory accesses of functions of the executable, by base, as JSON")
+    p.add_argument("symbols", nargs="+", help="mangled names")
+    p.add_argument("--static", action="store_true", help="the functions take no this pointer")
+    p.set_defaults(run=cmd_accesses)
 
     p = sub.add_parser("revng-object", help="build a version object of one function from rev.ng's C")
     p.add_argument("plain", type=Path, help="rev.ng's emit-c output converted with `revng ptml --plain`")

@@ -61,6 +61,18 @@ harvest-oracle batch master=DIR_A branch=DIR_B original=image
 
 `--cases` sets the number of generated cases (default 5000; a comparison changed to differ only on NaN, deep in a function, can differ in as few as 1 case in 500), `--returns` overrides the return type, `--static` marks a function without a `this` pointer, and `--arguments` gives the argument kinds of a function without a mangled parameter list.
 
+## Memory accesses by base
+
+`harvest-oracle accesses SYMBOL...` lists, for each function of the original executable, every memory access with its base, offset, size, direction and instruction, as JSON keyed by entry address:
+
+```
+{"0x4be1f0": {"symbol": "...", "signature": "...", "accesses": [
+  {"instruction": "0x4be287", "base": "this", "offset": "0xe0", "size": 8, "access": "read"},
+  {"instruction": "0x4be2a1", "base": "this.0xe0", "offset": "0x20", "size": 8, "access": "read"}, ...]}}
+```
+
+A forward dataflow over the function's code tracks which base each register holds: at entry `this` and the arguments in their argument registers, then through register copies, `lea` and constant offsets, spills to and reloads from stack slots, and loads of pointer fields, so an access through a pointer loaded from `this+0xe0` has base `this.0xe0`. Globals are named by the `symbols.tsv` symbol containing the address. A call clobbers the caller-saved registers, and where paths join with different bases a register holds none; accesses relative to the stack are left out.
+
 ## rev.ng's C as a version
 
 `harvest-oracle revng-object` builds a version object from [rev.ng](https://rev.ng)'s C of one function. rev.ng writes a function with a register-based prototype as C whose parameters name registers (`_REG(rcx_x86_64)`), so the object wraps it: an entry under the function's mangled name passes each native argument register to the parameter that names it, every callee with such a prototype becomes an adapter that puts its arguments back in their registers before the call is recorded, and rev.ng's helpers and wide-integer runtime are linked in. Segments and globals bind to the executable.
