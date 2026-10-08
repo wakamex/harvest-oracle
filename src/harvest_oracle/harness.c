@@ -38,12 +38,16 @@
 #define MAX_CALLS 4096
 #define MAX_SEGMENTS 8
 #define STACK_BASE 0x30000000UL
+// Argument registers a call may clobber hold this after every recorded call and, when unused, at entry, so
+// that a register still holding it at a call was not set for that call.
+#define POISON 0x0badc0de0badc0deUL
 #define STACK_SIZE 0x100000UL
 
 struct regs {
   uint64_t gp[6];   // rdi, rsi, rdx, rcx, r8, r9
   uint64_t xmm[8];  // low 64 bits of xmm0..xmm7
   uint64_t rax;     // al carries the vector register count for variadic callees
+  uint64_t site;    // return address of the call, which identifies its call site
 };
 
 struct result {
@@ -257,29 +261,73 @@ void oracle_stub(const char *name, const struct regs *regs, struct result *r) {
       r->rax = REGION_BASE + REGION_SIZE / 2 + (uint64_t)call_count * 0x100000;
 }
 
+// The image function under test, when the original code runs in place, and the image's .text section.
+static uint64_t own_start, own_end, text_start, text_end;
+
+// The executable's PLT entries, from ORACLE_PLT=ADDRESS=NAME,...: a call to one is a call to that import, handled
+// as a named stub so that allocators and math functions behave the same as in a linked version.
+#define MAX_PLT 1024
+static uint64_t plt_address[MAX_PLT];
+static char *plt_name[MAX_PLT];
+static int plt_count;
+
+static const char *plt_lookup(uint64_t address) {
+  for (int i = 0; i < plt_count; i++)
+    if (plt_address[i] == address)
+      return plt_name[i];
+  return NULL;
+}
+
+// Record a call to TARGET at the faulting context and return from it with generated values.
+static void emulate_call(ucontext_t *uc, uint64_t target) {
+  greg_t *g = uc->uc_mcontext.gregs;
+  {
+    {
+      struct regs regs = { { g[REG_RDI], g[REG_RSI], g[REG_RDX], g[REG_RCX], g[REG_R8], g[REG_R9] } };
+      for (int i = 0; i < 8; i++)
+        memcpy(&regs.xmm[i], &uc->uc_mcontext.fpregs->_xmm[i], 8);
+      regs.rax = g[REG_RAX];
+      regs.site = *(uint64_t *)g[REG_RSP];
+      struct result r;
+      const char *import = plt_lookup(target);
+      if (import) {
+        oracle_stub(import, &regs, &r);
+      } else {
+        record(target, NULL, &regs);
+        return_values(&r);
+      }
+      g[REG_RAX] = r.rax;
+      g[REG_RDX] = r.rdx;
+      memcpy(&uc->uc_mcontext.fpregs->_xmm[0], &r.xmm0, 8);
+      memcpy(&uc->uc_mcontext.fpregs->_xmm[1], &r.xmm1, 8);
+      g[REG_RDI] = g[REG_RSI] = g[REG_RCX] = g[REG_R8] = g[REG_R9] = POISON;
+      for (int x = 2; x < 8; x++) {
+        uint64_t poison = POISON;
+        memcpy(&uc->uc_mcontext.fpregs->_xmm[x], &poison, 8);
+      }
+      uint64_t *sp = (uint64_t *)g[REG_RSP];
+      g[REG_RIP] = sp[0];
+      g[REG_RSP] += 8;
+    }
+  }
+}
+
 static void handler(int signal, siginfo_t *info, void *context) {
   ucontext_t *uc = context;
   greg_t *g = uc->uc_mcontext.gregs;
   uint64_t rip = g[REG_RIP], fault = (uint64_t)info->si_addr;
   if (signal == SIGALRM)
     finish("timeout", rip, NULL);
+  // A call or jump out of the image function under test lands on the int3 filling the rest of its pages.
+  if (signal == SIGTRAP && own_end && rip - 1 >= text_start && rip - 1 < text_end &&
+      (rip - 1 < own_start || rip - 1 >= own_end)) {
+    emulate_call(uc, rip - 1);
+    return;
+  }
   if (signal == SIGSEGV) {
     // A call into the region or into the image's code: record it and return a generated value.
     if (fault == rip && (in_region(rip) || (rip >= image_text_start && rip < image_text_end))) {
-      struct regs regs = { { g[REG_RDI], g[REG_RSI], g[REG_RDX], g[REG_RCX], g[REG_R8], g[REG_R9] } };
-      for (int i = 0; i < 8; i++)
-        memcpy(&regs.xmm[i], &uc->uc_mcontext.fpregs->_xmm[i], 8);
-      regs.rax = g[REG_RAX];
-      record(rip, NULL, &regs);
-      struct result r;
-      return_values(&r);
-      g[REG_RAX] = r.rax;
-      g[REG_RDX] = r.rdx;
-      memcpy(&uc->uc_mcontext.fpregs->_xmm[0], &r.xmm0, 8);
-      memcpy(&uc->uc_mcontext.fpregs->_xmm[1], &r.xmm1, 8);
-      uint64_t *sp = (uint64_t *)g[REG_RSP];
-      g[REG_RIP] = sp[0];
-      g[REG_RSP] += 8;
+      emulate_call(uc, rip);
       return;
     }
     if (in_region(fault) && map_region_page(fault))
@@ -337,7 +385,8 @@ static void finish(const char *outcome, uint64_t detail, const struct result *re
   n += sprintf(line + n, ",\"calls\":[");
   for (int i = 0; i < call_count && n < sizeof(line) - 1024; i++) {
     struct call *c = &calls[i];
-    n += sprintf(line + n, "%s{\"to\":\"%s%s0x%lx\",\"gp\":[", i ? "," : "", c->name ? c->name : "", c->name ? "@" : "",
+    n += sprintf(line + n, "%s{\"site\":\"0x%lx\",\"to\":\"%s%s0x%lx\",\"gp\":[", i ? "," : "", c->regs.site,
+                 c->name ? c->name : "", c->name ? "@" : "",
                  c->target);
     for (int r = 0; r < 6; r++)
       n += sprintf(line + n, "%s\"0x%lx\"", r ? "," : "", c->regs.gp[r]);
@@ -439,13 +488,16 @@ __asm__(".text\n"
         "  lea -40(%rbp), %rsp; pop %r15; pop %r14; pop %r13; pop %r12; pop %rbx; pop %rbp; ret\n"
         ".globl oracle_thunk\n"
         "oracle_thunk:\n"
-        "  push %rbp; mov %rsp, %rbp; sub $160, %rsp; and $-16, %rsp\n"
+        "  push %rbp; mov %rsp, %rbp; sub $176, %rsp; and $-16, %rsp\n"
         "  mov %rdi, 0(%rsp); mov %rsi, 8(%rsp); mov %rdx, 16(%rsp); mov %rcx, 24(%rsp); mov %r8, 32(%rsp)\n"
         "  mov %r9, 40(%rsp); movq %xmm0, 48(%rsp); movq %xmm1, 56(%rsp); movq %xmm2, 64(%rsp); movq %xmm3, 72(%rsp)\n"
         "  movq %xmm4, 80(%rsp); movq %xmm5, 88(%rsp); movq %xmm6, 96(%rsp); movq %xmm7, 104(%rsp); mov %rax, 112(%rsp)\n"
-        "  mov %r11, %rdi; mov %rsp, %rsi; lea 120(%rsp), %rdx\n"
+        "  mov 8(%rbp), %r10; mov %r10, 120(%rsp)\n"
+        "  mov %r11, %rdi; mov %rsp, %rsi; lea 128(%rsp), %rdx\n"
         "  call oracle_stub\n"
-        "  mov 120(%rsp), %rax; mov 128(%rsp), %rdx; movq 136(%rsp), %xmm0; movq 144(%rsp), %xmm1\n"
+        "  mov 128(%rsp), %rax; mov 136(%rsp), %rdx; movq 144(%rsp), %xmm0; movq 152(%rsp), %xmm1\n"
+        "  movabs $0x0badc0de0badc0de, %rdi; mov %rdi, %rsi; mov %rdi, %rcx; mov %rdi, %r8; mov %rdi, %r9\n"
+        "  movq %rdi, %xmm2; movq %rdi, %xmm3; movq %rdi, %xmm4; movq %rdi, %xmm5; movq %rdi, %xmm6; movq %rdi, %xmm7\n"
         "  leave; ret\n");
 void oracle_call(uint64_t entry, const struct regs *regs, struct result *result);
 uint64_t oracle_saved_rsp;
@@ -459,8 +511,33 @@ int main(int argc, char **argv) {
   uint64_t first = strtoull(argv[5], NULL, 0), count = strtoull(argv[6], NULL, 0);
   seed = 0;  // the image's generated .bss contents use seed 0, the same for every case and variant
   if (!map_elf(argv[1], image, &image_count, 1, &image_text_start, &image_text_end) ||
-      !map_elf(argv[2], variant, &variant_count, 0, NULL, NULL))
+      (strcmp(argv[2], "-") != 0 && !map_elf(argv[2], variant, &variant_count, 0, NULL, NULL)))
     return 1;
+  // With ORACLE_IMAGE_FUNCTION=START:SIZE and ORACLE_TEXT=START:END, the image's own code of that function
+  // runs in place: its pages become executable, with every other byte of .text in them replaced by int3.
+  char *plt = getenv("ORACLE_PLT");
+  for (char *entry = plt ? strtok(plt, ",") : NULL; entry && plt_count < MAX_PLT; entry = strtok(NULL, ",")) {
+    char *name = strchr(entry, '=');
+    if (!name)
+      continue;
+    *name++ = 0;
+    plt_address[plt_count] = strtoull(entry, NULL, 0);
+    plt_name[plt_count++] = name;
+  }
+  const char *own = getenv("ORACLE_IMAGE_FUNCTION"), *text = getenv("ORACLE_TEXT");
+  if (own && text) {
+    char *rest;
+    own_start = strtoull(own, &rest, 0);
+    own_end = own_start + strtoull(rest + 1, NULL, 0);
+    text_start = strtoull(text, &rest, 0);
+    text_end = strtoull(rest + 1, NULL, 0);
+    uint64_t first = own_start & ~(PAGE - 1), last = (own_end + PAGE - 1) & ~(PAGE - 1);
+    mprotect((void *)first, last - first, PROT_READ | PROT_WRITE);
+    for (uint64_t a = first; a < last; a++)
+      if (a >= text_start && a < text_end && (a < own_start || a >= own_end))
+        *(unsigned char *)a = 0xcc;
+    mprotect((void *)first, last - first, PROT_READ | PROT_EXEC);
+  }
   // Named stubs jump through oracle_thunk_slot, a variant symbol at a fixed address given by oracle.py.
   const char *slot = getenv("ORACLE_THUNK_SLOT");
   if (slot)
@@ -478,6 +555,7 @@ int main(int argc, char **argv) {
   sigaction(SIGFPE, &sa, NULL);
   sigaction(SIGILL, &sa, NULL);
   sigaction(SIGALRM, &sa, NULL);
+  sigaction(SIGTRAP, &sa, NULL);
 
   for (uint64_t s = first; s < first + count; s++) {
     int fds[2];
@@ -500,6 +578,11 @@ int main(int argc, char **argv) {
           regs.xmm[xmm++] = value;
         else
           regs.gp[gp++] = value;
+      }
+      for (; gp < 6; gp++)
+        regs.gp[gp] = POISON;
+      for (; xmm < 8; xmm++) {
+        regs.xmm[xmm] = POISON;
       }
       alarm(2);
       struct result result;

@@ -48,7 +48,12 @@ def cmd_batch(args):
         address, returns, unit, symbol = line.split("\t")
         if args.only and address not in args.only:
             continue
-        versions = {name: Path(directory) / f"{unit}.o" for name, directory in directories.items()}
+        versions = {name: oracle.IMAGE if directory == oracle.IMAGE else Path(directory) / f"{unit}.o"
+                    for name, directory in directories.items()}
+        missing = [str(path) for path in versions.values() if path != oracle.IMAGE and not path.exists()]
+        if missing:
+            print(json.dumps({"address": address, "symbol": symbol, "skipped": f"missing {', '.join(missing)}"}))
+            continue
         out = args.keep / address if args.keep else None
         report = oracle.check(harvest, symbol, versions, cases=args.cases, returns=returns, out=out)
         pairs = {k: f"{v['agree']}/{v['agree'] + v['differ']}" for k, v in report["comparison"].items()}
@@ -85,12 +90,14 @@ def main(argv=None):
 
     p = sub.add_parser("compare", help="compare any number of versions; print the full report")
     p.add_argument("symbol", help="mangled name of the function")
-    p.add_argument("versions", nargs="+", help="NAME=OBJECT; the first is the reference")
+    p.add_argument("versions", nargs="+", help="NAME=OBJECT, or NAME=image for the executable's own code run in place; "
+                                               "the first is the reference")
     common(p)
     p.set_defaults(run=cmd_compare)
 
     p = sub.add_parser("batch", help="check every function of a table; one JSON line per function")
-    p.add_argument("builds", nargs="+", help="NAME=DIRECTORY of <unit>.o files; the first is the reference")
+    p.add_argument("builds", nargs="+", help="NAME=DIRECTORY of <unit>.o files, or NAME=image for the executable's "
+                                             "own code; the first is the reference")
     p.add_argument("--functions", type=Path, help="table of address, returns, unit, symbol (default: built in)")
     p.add_argument("--only", nargs="*", help="addresses to run")
     common(p)

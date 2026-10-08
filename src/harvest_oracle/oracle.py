@@ -18,9 +18,16 @@ from importlib import resources
 from pathlib import Path
 
 BASE = 0x20000000
+# A version given as this path runs the original executable's own code of the function in place.
+IMAGE = "image"
 # Undefined symbols without an address in symbols.tsv that are data, not functions.
 DATA_PREFIXES = ("_ZTV", "_ZTI", "_ZTS", "__dso_handle")
-# Registers compared for calls without a known signature, such as virtual calls: integer and float.
+# The harness fills the argument registers a call may clobber with this after every recorded call, and the
+# unused ones at entry: a register still holding it at a call was not set for that call.
+POISON = "0xbadc0de0badc0de"
+# Registers that can carry arguments of a call without a known signature, such as a virtual call: rdi and rsi,
+# and xmm0 to xmm3. Code uses the other argument registers as scratch between calls often enough that comparing
+# them reports leftovers as differences.
 UNKNOWN_GP, UNKNOWN_XMM = 2, 4
 
 # Bytes to compare behind a pointer or reference argument that points into the stack or a version's own
@@ -59,6 +66,21 @@ class Harvest:
             self.known[name] = int(address, 16)
             self.sizes[name] = int(size)
         self.names = {address: name for name, address in self.known.items()}
+        self._plt = None
+
+    @property
+    def plt(self):
+        """The executable's PLT entries as ADDRESS=NAME pairs, from the disassembler's name@plt labels."""
+        if self._plt is None:
+            entries = []
+            listing = subprocess.run(["objdump", "-d", "--no-show-raw-insn", "-j", ".plt", str(self.image)],
+                                     capture_output=True, text=True).stdout
+            for line in listing.splitlines():
+                m = re.match(r"([0-9a-f]+) <(.+)@plt>:", line)
+                if m:
+                    entries.append(f"0x{int(m.group(1), 16):x}={m.group(2)}")
+            self._plt = ",".join(entries)
+        return self._plt
 
     def return_kind(self, signature):
         """The return type of a member function from its declarations in src/, when they agree."""
@@ -257,8 +279,23 @@ def normalized_writes(writes, ranges):
     return result
 
 
-def execute(harvest, elf, entry, slot, spec, cases):
-    env = {"ORACLE_THUNK_SLOT": f"0x{slot:x}"}
+def text_section(image):
+    """The executable's .text section as (start, end)."""
+    for line in run(["readelf", "-SW", str(image)]).splitlines():
+        m = re.search(r"\]\s+\.text\s+PROGBITS\s+([0-9a-f]+)\s+[0-9a-f]+\s+([0-9a-f]+)", line)
+        if m:
+            return int(m.group(1), 16), int(m.group(1), 16) + int(m.group(2), 16)
+    raise SystemExit(f"{image} has no .text section")
+
+
+def execute(harvest, elf, entry, slot, spec, cases, own=None):
+    """Run the harness. ELF is a linked version, or "-" with OWN = (start, size) to run the executable's own
+    code of the function in place."""
+    env = {"ORACLE_THUNK_SLOT": f"0x{slot:x}"} if slot else {}
+    env["ORACLE_PLT"] = harvest.plt
+    if own:
+        text = text_section(harvest.image)
+        env.update(ORACLE_IMAGE_FUNCTION=f"0x{own[0]:x}:{own[1]}", ORACLE_TEXT=f"0x{text[0]:x}:0x{text[1]:x}")
     output = subprocess.run([str(harness_binary()), str(harvest.image), str(elf), f"0x{entry:x}", spec, "1",
                              str(cases)], check=True, capture_output=True, text=True, env=env).stdout
     return [json.loads(line) for line in output.splitlines()]
@@ -276,8 +313,10 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
     diffs = []
     if a["outcome"] != b["outcome"]:
         diffs.append(f"outcome {a['outcome']} vs {b['outcome']}")
-    elif a["outcome"] != "return" and a["detail"] != b["detail"]:
-        diffs.append(f"{a['outcome']} at {a['detail']} vs {b['detail']}")
+    elif a["outcome"] == "crash" and int(a["detail"], 16) >> 12 != int(b["detail"], 16) >> 12:
+        # A fault's page: within a page, which field of a bad pointer is read first is scheduling. Other
+        # signals record the faulting instruction, whose address differs between any two builds.
+        diffs.append(f"crash at {a['detail']} vs {b['detail']}")
     elif a["outcome"] == "return":
         masks = {"int": ("rax", 0xFFFFFFFF), "bool": ("rax", 0xFF), "float": ("xmm0", 0xFFFFFFFF)}
         if return_kind in masks:
@@ -290,17 +329,23 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
             diffs.append(f"call {i}: {ix} vs {iy}")
             break
         count = signatures.get(ix)
-        gp_count = count[0] if count else UNKNOWN_GP
-        if not count and x["xmm"][:UNKNOWN_XMM] != y["xmm"][:UNKNOWN_XMM]:
-            diffs.append(f"call {i} {ix} float registers {x['xmm'][:UNKNOWN_XMM]} vs {y['xmm'][:UNKNOWN_XMM]}")
-            break
+        if count:
+            gp_indices = range(count[0])
+        else:
+            # Without a signature, such as a virtual call, compare the registers both versions set for it.
+            gp_indices = [k for k in range(UNKNOWN_GP) if POISON not in (x["gp"][k], y["gp"][k])]
+            xmm_indices = [k for k in range(UNKNOWN_XMM) if POISON not in (x["xmm"][k], y["xmm"][k])]
+            fa, fb = [x["xmm"][k] for k in xmm_indices], [y["xmm"][k] for k in xmm_indices]
+            if fa != fb:
+                diffs.append(f"call {i} {ix} float registers {fa} vs {fb}")
+                break
         sizes = pointee.get(ix, [])
 
         def shown(call, ranges):
             # The bytes behind a local are translated too: a local object's vtable pointer, say.
             return [d and "local:" + normalized_writes([["0x0", d]], ranges)[0][1][: 2 * (sizes[k] if k < len(sizes) else 8)]
                     or hex(translate(int(v, 16), ranges))
-                    for k, (v, d) in enumerate(zip(call["gp"][:gp_count], call["deref"]))]
+                    for k, v, d in ((k, call["gp"][k], call["deref"][k]) for k in gp_indices)]
 
         xa, xb = shown(x, ranges_a), shown(y, ranges_b)
         if xa != xb:
@@ -337,8 +382,16 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         directory.mkdir(parents=True, exist_ok=True)
         results, stub_lists, ranges = {}, {}, {}
         for name, obj in versions.items():
-            elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
-            results[name] = execute(harvest, elf, entry, slot, spec, cases)
+            if str(obj) == IMAGE:
+                # The executable's own code of the function, run in place: no object, no delinking.
+                if function not in harvest.known or not harvest.sizes.get(function):
+                    raise SystemExit(f"{function} has no address and size in {harvest.symbols}")
+                start, size = harvest.known[function], harvest.sizes[function]
+                stubs, ranges[name] = [], []
+                results[name] = execute(harvest, "-", start, None, spec, cases, own=(start, size))
+            else:
+                elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
+                results[name] = execute(harvest, elf, entry, slot, spec, cases)
             stub_lists[name] = stubs
             describe_callees(stubs, signatures, pointee)
             if out:

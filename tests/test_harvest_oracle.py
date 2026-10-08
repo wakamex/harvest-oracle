@@ -16,7 +16,7 @@ from harvest_oracle.cli import main
 EXECUTABLE = r"""
 int counter = 7;
 float scale = 2.0f;
-int callee(int value) { return value + 1; }
+__attribute__((noinline)) int callee(int value) { return value + 1; }
 extern "C" void _start(void) { for (;;) {} }
 """
 
@@ -56,14 +56,14 @@ class SyntheticCheckout(unittest.TestCase):
         build = root / "orig" / "test"
         build.mkdir(parents=True)
         (root / "config" / "test").mkdir(parents=True)
-        (root / "exe.cpp").write_text(EXECUTABLE)
+        (root / "exe.cpp").write_text(EXECUTABLE + FUNCTION)
         executable = build / "Harvest"
         run(["g++", "-O1", "-static", "-no-pie", "-fno-pic", "-nostdlib", "-Wl,-Ttext-segment=0x400000",
              "-o", str(executable), str(root / "exe.cpp")])
         symbols = ["address\tsize\tsymbol\tevidence"]
         for line in run(["nm", "-S", str(executable)]).splitlines():
             parts = line.split()
-            if len(parts) == 4 and parts[3] in ("counter", "scale", "_Z6calleei"):
+            if len(parts) == 4 and parts[3] in ("counter", "scale", "_Z6calleei", UPDATE):
                 symbols.append(f"0x{int(parts[0], 16):x}\t{int(parts[1], 16)}\t{parts[3]}\ttest")
         (root / "config" / "test" / "symbols.tsv").write_text("\n".join(symbols) + "\n")
         cls.root = root
@@ -89,6 +89,11 @@ class SyntheticCheckout(unittest.TestCase):
 
     def test_comparison_that_differs_only_on_nan_is_caught(self):
         self.assertGreater(self.check("o2", "nan")["differ"], 0)
+
+    def test_object_agrees_with_the_executables_own_code_run_in_place(self):
+        report = oracle.check(oracle.Harvest(self.root, "test"), UPDATE, {"a": self.objects["o2"], "b": "image"},
+                              cases=200, returns="int", static=True)
+        self.assertEqual(report["comparison"]["a vs b"]["differ"], 0)
 
     def test_check_command_prints_one_line(self):
         output = run([sys.executable, "-m", "harvest_oracle", "--harvest", str(self.root), "--build", "test", "check",

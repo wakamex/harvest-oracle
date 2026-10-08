@@ -4,24 +4,24 @@ harvest-oracle checks whether two builds of one function from the [Harvest decom
 
 ## How a case runs
 
-Each version is an object file that defines the function: a build of Harvest's source, the target object delinked from the original executable, or an object compiled from a decompiler's C. It is linked alone at 0x20000000, with every other symbol bound to its address in the original executable (`config/<build>/symbols.tsv`).
+Each version is an object file that defines the function, such as a build of Harvest's source or an object compiled from a decompiler's C, or `image`, the original executable's own code of the function. An object is linked alone at 0x20000000, with every other symbol bound to its address in the original executable (`config/<build>/symbols.tsv`). The `image` version runs in place at its original address: the pages holding the function become executable, with every other byte of `.text` in them replaced by `int3`, so its references to the executable's data are exact and a call to any other function is caught. It needs no delinked object.
 
 The harness maps the original executable's segments at their addresses, with its code not executable, then calls the function with argument registers generated from the case seed. Memory the function reaches through generated pointers is mapped on first touch, with bytes that depend only on the seed and the address, so every version reads the same memory whatever order it reads it in. Pointers carry float bit patterns in their low 32 bits, NaN and the infinities included, so float fields read from memory see special values.
 
-A call into the executable's code or into generated memory faults and is recorded with its argument registers as a call out of the function, then returns a generated value; so does a call to a named stub, which stands in for a callee without a known address. Allocators return fresh memory, and math library functions such as `sin` and `sqrt` run for real without being recorded, since a compiler may reorder or combine them. Each case runs in a forked child.
+A call into the executable's code or into generated memory faults and is recorded with its argument registers as a call out of the function, then returns a generated value; so does a call to a named stub, which stands in for a callee without a known address, and a call to one of the executable's PLT entries, which is handled as the import it names. Allocators return fresh memory, and math library functions such as `sin` and `sqrt` run for real without being recorded, since a compiler may reorder or combine them. After every recorded call the argument registers a callee may clobber hold a fixed poison value, as do unused argument registers at entry, so a register still holding it at the next call was not set for that call. Each case runs in a forked child.
 
 ## What is compared
 
 For each case:
 
-- the outcome (return, fault or timeout) and the fault address
+- the outcome (return, fault or timeout) and the page of a fault address
 - the return value, by the function's return type, read from its declaration under `src/`
 - the ordered calls out of the function with their arguments, up to the callee's parameter count from its mangled name
 - every 8-byte word written to generated memory or to the executable's globals, for cases that return
 
-Calls without a known signature, such as virtual calls, compare two integer and four float argument registers. An argument that points into the stack, into the version's own data or into the executable's read-only data is compared by the bytes it points at, up to the size of its parameter type. A pointer into a version's own copy of executable data (a section named after a symbol of the executable, such as `.rodata._ZTV...`) is translated to the executable's address before comparing. Writes are not compared for cases that fault, since which stores precede a faulting load depends on instruction scheduling.
+Calls without a known signature, such as virtual calls, compare `rdi`, `rsi` and `xmm0` to `xmm3`, skipping any register that still holds the poison in either version. An argument that points into the stack, into the version's own data or into the executable's read-only data is compared by the bytes it points at, up to the size of its parameter type. A pointer into a version's own copy of executable data (a section named after a symbol of the executable, such as `.rodata._ZTV...`) is translated to the executable's address before comparing. Writes are not compared for cases that fault, since which stores precede a faulting load depends on instruction scheduling.
 
-Delinked target objects need two more bindings, both by the label's name: `lbl_<address>` is bound to that address in the executable, and `sub_<address>` inside the function under test to the same offset in the linked copy.
+Delinked target objects can also be checked as objects. They need two more bindings, both by the label's name: `lbl_<address>` is bound to that address in the executable, and `sub_<address>` inside the function under test to the same offset in the linked copy. Prefer `image` for the original code: a delinked object can resolve a reference to the wrong data, such as a wide string literal to a narrow one in a merged string section, which the linker then shortens.
 
 ## Installation
 
@@ -45,14 +45,14 @@ harvest-oracle check build/master/X.o build/match/1.18-linux-amd64/X.o --symbol 
 Compare any number of versions of a function, the first being the reference, and keep the per-case records:
 
 ```
-harvest-oracle compare SYMBOL master=A.o branch=B.o target=T.o --keep runs/
+harvest-oracle compare SYMBOL master=A.o branch=B.o original=image --keep runs/
 harvest-oracle explain runs/ master target SEED
 ```
 
 Check every function of a table of address, return type, unit and symbol (the built-in table holds a set of rewritten functions) against directories of unit objects:
 
 ```
-harvest-oracle batch master=DIR_A branch=DIR_B target=build/objdiff/1.18-linux-amd64/target
+harvest-oracle batch master=DIR_A branch=DIR_B original=image
 ```
 
 `--cases` sets the number of generated cases (default 400), `--returns` overrides the return type, `--static` marks a function without a `this` pointer, and `--arguments` gives the argument kinds of a function without a mangled parameter list.
