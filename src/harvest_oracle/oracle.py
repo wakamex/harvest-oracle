@@ -408,6 +408,28 @@ def integer_setups(path, start, end):
     return setups
 
 
+def cached_image_run(harvest, start, size, spec, cases):
+    """The executable's own code run in place: the same for every check of a function, so it is kept in the user
+    cache, keyed by the executable, the function, its arguments, the case count and the harness build."""
+    image = harvest.image.stat()
+    key = hashlib.sha256(f"{harvest.image.resolve()}:{image.st_size}:{image.st_mtime_ns}:{start}:{size}:{spec}:"
+                         f"{cases}:{harness_binary().name}".encode()).hexdigest()[:24]
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle" / "image-runs"
+    path = cache / f"{key}.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    result = execute(harvest, "-", start, None, spec, cases, own=(start, size))
+    cache.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(result))
+    temporary.replace(path)
+    return result
+
+
+def inside_ranges(value, *range_lists):
+    return any(start <= value < start + size for ranges in range_lists for start, size, _ in ranges)
+
+
 def call_identity(call, names):
     target = call["to"]
     if "@" in target:
@@ -458,7 +480,12 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
                     or hex(translate(int(v, 16), ranges))
                     for k, v, d in ((k, call["gp"][k], call["deref"][k]) for k in gp_indices)]
 
-        xa, xb = shown(x, ranges_a), shown(y, ranges_b)
+        # Identical raw arguments, none pointing into translated data, are equal without translating.
+        if (all(x["gp"][k] == y["gp"][k] and x["deref"][k] == y["deref"][k] for k in gp_indices)
+                and not any(inside_ranges(int(x["gp"][k], 16), ranges_a, ranges_b) for k in gp_indices)):
+            xa = xb = None
+        else:
+            xa, xb = shown(x, ranges_a), shown(y, ranges_b)
         if xa != xb:
             diffs.append(f"call {i} {ix} args {xa} vs {xb}")
             break
@@ -500,7 +527,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                     raise SystemExit(f"{function} has no address and size in {harvest.symbols}")
                 start, size = harvest.known[function], harvest.sizes[function]
                 stubs, ranges[name] = [], []
-                results[name] = execute(harvest, "-", start, None, spec, cases, own=(start, size))
+                results[name] = cached_image_run(harvest, start, size, spec, cases)
                 setups[name] = integer_setups(harvest.image, start, start + size)
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
