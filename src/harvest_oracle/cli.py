@@ -1,6 +1,7 @@
 """Command line for differential checks of Harvest functions."""
 
 import argparse
+import tempfile
 import json
 import os
 import sys
@@ -89,9 +90,18 @@ def cmd_accesses(args):
         params = oracle.parameters(signature) if "(" in signature else []
         names += [f"argument {i + 1}" for i, p in enumerate(params) if p not in ("float", "double")]
         names += [f"argument {len(params) + i + 1}" for i in range(6)]
-        result[f"0x{start:x}"] = {"symbol": symbol, "signature": signature,
-                                  "accesses": accesses.analyze(harvest.image, start, start + size, names[:6],
-                                                               globals_)}
+        path, first, last = harvest.image, start, start + size
+        if args.object:
+            # The object's own code of the function, linked alone with every other symbol bound to the
+            # executable, so globals carry the same names as in the executable's list.
+            with tempfile.TemporaryDirectory() as scratch:
+                elf, entry, *_ = oracle.link(harvest, "object", args.object, symbol, Path(scratch))
+                linked = next(int(line.split()[1], 16) for line in oracle.run(["nm", "-S", str(elf)]).splitlines()
+                              if len(line.split()) == 4 and line.split()[3] == symbol)
+                found = accesses.analyze(elf, entry, entry + linked, names[:6], globals_)
+        else:
+            found = accesses.analyze(path, first, last, names[:6], globals_)
+        result[f"0x{start:x}"] = {"symbol": symbol, "signature": signature, "accesses": found}
     print(json.dumps(result, indent=1))
     return 0
 
@@ -138,6 +148,8 @@ def main(argv=None):
     p = sub.add_parser("accesses", help="the memory accesses of functions of the executable, by base, as JSON")
     p.add_argument("symbols", nargs="+", help="mangled names")
     p.add_argument("--static", action="store_true", help="the functions take no this pointer")
+    p.add_argument("--object", type=Path, help="analyze this object's code of the functions instead of the "
+                                               "executable's; keys stay the executable's entry addresses")
     p.set_defaults(run=cmd_accesses)
 
     p = sub.add_parser("revng-object", help="build a version object of one function from rev.ng's C")
