@@ -1,0 +1,19 @@
+[project]
+name = "harvest-oracle"
+version = "0.1.0"
+description = "Differential checks of single Harvest functions across versions of their machine code"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+harvest-oracle = "harvest_oracle.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = ["src/harvest_oracle/harness.c", "src/harvest_oracle/functions.tsv"]
