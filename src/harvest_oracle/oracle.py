@@ -351,6 +351,44 @@ def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, gua
     return [json.loads(line) for line in output.splitlines()]
 
 
+GP_NAMES = [("rdi", "edi", "di", "dil"), ("rsi", "esi", "si", "sil"), ("rdx", "edx", "dx", "dl"),
+            ("rcx", "ecx", "cx", "cl"), ("r8", "r8d", "r8w", "r8b"), ("r9", "r9d", "r9w", "r9b")]
+
+
+def integer_setups(path, start, end):
+    """For each call in [START, END) of PATH, by return address, the integer argument registers written by the
+    straight-line instructions before it, back to the previous call, jump or branch target. Code also uses those
+    registers as scratch between calls, so for a call without a known signature only a register both versions
+    set up for that call is compared."""
+    listing = run(["objdump", "-d", "--no-show-raw-insn", f"--start-address=0x{start:x}", f"--stop-address=0x{end:x}",
+                   str(path)])
+    instructions, targets = [], set()
+    for line in listing.splitlines():
+        m = re.match(r"\s*([0-9a-f]+):\s+(\S+)\s*(.*)", line)
+        if not m:
+            continue
+        address, mnemonic, operands = int(m.group(1), 16), m.group(2), m.group(3).split("#")[0].strip()
+        instructions.append((address, mnemonic, operands))
+        t = re.match(r"([0-9a-f]+)\b", operands) if mnemonic.startswith(("j", "call")) else None
+        if t:
+            targets.add(int(t.group(1), 16))
+    setups = {}
+    for i, (address, mnemonic, _) in enumerate(instructions):
+        if not mnemonic.startswith("call") or i + 1 >= len(instructions):
+            continue
+        written = set()
+        for j in range(i - 1, -1, -1):
+            a, mn, ops = instructions[j]
+            if mn.startswith(("call", "j", "ret")):
+                break
+            destination = ops.rsplit(",", 1)[-1].strip().lstrip("%") if ops else ""
+            written.update(k for k, names in enumerate(GP_NAMES) if destination in names)
+            if a in targets:
+                break
+        setups[instructions[i + 1][0]] = written
+    return setups
+
+
 def call_identity(call, names):
     target = call["to"]
     if "@" in target:
@@ -358,7 +396,8 @@ def call_identity(call, names):
     return names.get(int(target, 16), target)
 
 
-def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, return_kind):
+def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, return_kind, setups_a=None,
+                     setups_b=None):
     """How case A and case B differ, as a list of short descriptions; empty when they agree."""
     diffs = []
     if a["outcome"] != b["outcome"]:
@@ -383,7 +422,10 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
             gp_indices = range(count[0])
         else:
             # Without a signature, such as a virtual call, compare the registers both versions set for it.
-            gp_indices = [k for k in range(UNKNOWN_GP) if POISON not in (x["gp"][k], y["gp"][k])]
+            sa = (setups_a or {}).get(int(x.get("site", "0x0"), 16))
+            sb = (setups_b or {}).get(int(y.get("site", "0x0"), 16))
+            gp_indices = [k for k in range(UNKNOWN_GP) if POISON not in (x["gp"][k], y["gp"][k])
+                          and (k == 0 or sa is None or sb is None or (k in sa and k in sb))]
             xmm_indices = [k for k in range(UNKNOWN_XMM) if POISON not in (x["xmm"][k], y["xmm"][k])]
             fa, fb = [x["xmm"][k] for k in xmm_indices], [y["xmm"][k] for k in xmm_indices]
             if fa != fb:
@@ -430,7 +472,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
     with tempfile.TemporaryDirectory() as scratch:
         directory = Path(out) if out else Path(scratch)
         directory.mkdir(parents=True, exist_ok=True)
-        results, stub_lists, ranges, runners = {}, {}, {}, {}
+        results, stub_lists, ranges, runners, setups = {}, {}, {}, {}, {}
         for name, obj in versions.items():
             if str(obj) == IMAGE:
                 # The executable's own code of the function, run in place: no object, no delinking.
@@ -439,9 +481,13 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                 start, size = harvest.known[function], harvest.sizes[function]
                 stubs, ranges[name] = [], []
                 results[name] = execute(harvest, "-", start, None, spec, cases, own=(start, size))
+                setups[name] = integer_setups(harvest.image, start, start + size)
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
                 results[name] = execute(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf, function))
+                size = next(int(line.split()[1], 16) for line in run(["nm", "-S", str(elf)]).splitlines()
+                            if line.split()[-1] == function and len(line.split()) == 4)
+                setups[name] = integer_setups(elf, entry, entry + size)
                 # The same version with its own data 4 KB further on, for the layout check.
                 padded = directory / "padded"
                 padded.mkdir(exist_ok=True)
@@ -451,15 +497,16 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             if out:
                 (directory / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results[name]))
 
-        def differs(a, b, ra, rb):
-            return case_differences(a, b, ra, rb, harvest.names, signatures, pointee, return_kind)
+        def differs(a, b, ra, rb, sa=None, sb=None):
+            return case_differences(a, b, ra, rb, harvest.names, signatures, pointee, return_kind, sa, sb)
 
         reference, *others = list(results)
         # A case in which any version reads past a static table it indexes is undefined: what lies past the
         # table depends on each build's data layout.
         undefined = {i for rs in results.values() for i, r in enumerate(rs) if r["outcome"] == "undefined"}
         differing = {other: [i for i, (a, b) in enumerate(zip(results[reference], results[other]))
-                             if i not in undefined and differs(a, b, ranges[reference], ranges[other])]
+                             if i not in undefined and differs(a, b, ranges[reference], ranges[other],
+                                                               setups[reference], setups[other])]
                      for other in others}
         # Layout check: a differing case that some version answers differently once its own data moves depends
         # on that layout (an out-of-range index into a static table, a value derived from an address), not on
@@ -478,7 +525,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         real = [i for i in differing[other] if i not in layout_dependent]
         examples = [{"seed": results[reference][i]["seed"],
                      "differences": differs(results[reference][i], results[other][i], ranges[reference],
-                                            ranges[other])} for i in real[:5]]
+                                            ranges[other], setups[reference], setups[other])} for i in real[:5]]
         comparison[f"{reference} vs {other}"] = {
             "agree": cases - len(differing[other]) - len(undefined), "differ": len(real),
             "layout_dependent": len(differing[other]) - len(real), "undefined": len(undefined), "examples": examples}

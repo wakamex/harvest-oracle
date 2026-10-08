@@ -203,7 +203,7 @@ static void return_values(struct result *r) {
   r->rax = word(h);
   r->rdx = word(mix(h));
   r->xmm0 = ((h >> 20) & 1) ? doubles[(h >> 21) & 7] : floats[(h >> 21) & 15];
-  r->xmm1 = 0;
+  r->xmm1 = POISON;  // only float structs return in xmm1; for every other call it is clobbered
 }
 
 static void record(uint64_t target, const char *name, const struct regs *regs) {
@@ -267,6 +267,7 @@ static int math(const char *name, const struct regs *regs, struct result *r) {
 
 void oracle_stub(const char *name, const struct regs *regs, struct result *r) {
   memset(r, 0, sizeof(*r));
+  r->xmm1 = POISON;
   if (math(name, regs, r))
     return;
   record(0, name, regs);
