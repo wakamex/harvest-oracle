@@ -154,6 +154,13 @@ class Helpers(unittest.TestCase):
         writes = [["0x1000", (0x20005068).to_bytes(8, "little").hex()]]
         self.assertEqual(oracle.normalized_writes(writes, ranges)[0][1], (0x5F0C70).to_bytes(8, "little").hex())
 
+    def test_indirect_call_reads_its_vtable_slot(self):
+        registers = {"rax": ("this.0x20.0x0", 0), "rdi": ("this", 0)}
+        record = accesses.step("call", ["*0x150(%rax)"], registers, {}, [])
+        self.assertEqual((record["base"], record["offset"], record["access"]), ("this.0x20.0x0", "0x150", "read"))
+        self.assertNotIn("rdi", registers)
+        self.assertIsNone(accesses.step("call", ["4a6e4c"], {}, {}, []))
+
 
 class Entrypoints(unittest.TestCase):
     def test_help(self):

@@ -144,19 +144,23 @@ def base_of(text, registers, symbols):
 
 def step(mnemonic, ops, registers, slots, symbols):
     """Apply one instruction to the register and stack-slot bases; return its access, if any."""
-    if mnemonic.startswith("call"):
-        for r in CLOBBERED:
-            registers.pop(r, None)
-        return None
     destination = ops[-1] if ops else ""
-    memory = [op for op in ops if is_memory(op)]
+    # An indirect call or jump through memory (`call *0x150(%rax)`) reads its target there; a direct one has none.
+    memory = [op.lstrip("*") for op in ops if op.startswith("*") and is_memory(op.lstrip("*"))]
+    if not mnemonic.startswith(("call", "j")):
+        memory = [op for op in ops if is_memory(op)]
     record = None
     if memory and not mnemonic.startswith(NO_ACCESS):
         where = base_of(memory[0], registers, symbols)
         if where and where[0] != "stack":
             writes = memory[0] == destination and not mnemonic.startswith(("cmp", "test", "ucomis", "comis", "bt"))
             record = {"base": where[0], "offset": None if where[1] is None else f"0x{where[1]:x}" if where[1] >= 0
-                      else f"-0x{-where[1]:x}", "size": access_size(mnemonic, ops), "access": "write" if writes else "read"}
+                      else f"-0x{-where[1]:x}", "size": 8 if mnemonic.startswith(("call", "j")) else access_size(mnemonic, ops),
+                      "access": "write" if writes else "read"}
+    if mnemonic.startswith("call"):
+        for r in CLOBBERED:
+            registers.pop(r, None)
+        return record
     target = WIDTHS.get(destination.lstrip("%"), (None,))[0] if destination.startswith("%") else None
     if mnemonic.startswith(READ_ONLY):
         target = None
