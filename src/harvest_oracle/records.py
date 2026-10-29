@@ -15,7 +15,7 @@ MAGIC = int.from_bytes(b"ORCALL01", "little")
 
 class PackedCalls(Sequence):
     def __init__(self, data, names):
-        self.data = data
+        self.data = memoryview(data)
         self.names = names
 
     def __len__(self):
@@ -26,6 +26,21 @@ class PackedCalls(Sequence):
 
     def targets(self):
         return TARGET.iter_unpack(self.data)
+
+    def equal_capture_prefix(self, other):
+        """Sufficient raw equality of every captured field except the instruction's return site."""
+        if self.names != other.names:
+            return False
+        size = min(len(self.data), len(other.data))
+        a, b = self.data[:size].cast("Q"), other.data[:size].cast("Q")
+        stride = CALL.size // 8
+        return all(a[column::stride] == b[column::stride] for column in range(stride) if column != 17)
+
+    def addresses(self, count):
+        """Distinct targets and integer arguments of a prefix, for translation checks."""
+        words = self.data[:count * CALL.size].cast("Q")
+        stride = CALL.size // 8
+        return {value for column in (0, 2, 3, 4, 5, 6, 7) for value in set(words[column::stride])}
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -76,10 +91,8 @@ def decode_records(data):
             length, = struct.unpack("<Q", take(8))
             names.append(take(length).tobytes().decode())
         # Validate name indices even when no consumer materializes the calls.
-        for index in range(count):
-            name, = struct.unpack_from("<Q", calls, index * CALL.size + 8)
-            if name > name_count:
-                raise ValueError("invalid oracle call name")
+        if max(calls.cast("Q")[1::CALL.size // 8], default=0) > name_count:
+            raise ValueError("invalid oracle call name")
         record["calls"] = PackedCalls(calls, names)
         result.append(record)
     return result

@@ -1238,13 +1238,18 @@ int main(int argc, char **argv) {
     set_byte(coverage_probes[i].address, 0xcc);
   }
 
+  // A case is the only writer until waitpid completes, so regular files need no parent relay.
+  struct stat output_stat;
+  int direct_output = fstat(STDOUT_FILENO, &output_stat) == 0 && S_ISREG(output_stat.st_mode);
   for (uint64_t s = first; s < first + count; s++) {
     int fds[2];
-    pipe(fds);
+    if (!direct_output && pipe(fds) < 0)
+      return perror("record pipe"), 3;
     pid_t pid = fork();
     if (pid == 0) {
-      close(fds[0]);
-      out_fd = fds[1];
+      if (!direct_output)
+        close(fds[0]);
+      out_fd = direct_output ? STDOUT_FILENO : fds[1];
       seed = s;
       struct regs regs = { 0 };
       int gp = 0, xmm = 0;
@@ -1273,13 +1278,15 @@ int main(int argc, char **argv) {
       alarm(0);
       finish("return", 0, &result);
     }
-    close(fds[1]);
-    char buffer[1 << 16];
-    ssize_t n;
-    while ((n = read(fds[0], buffer, sizeof(buffer))) > 0)
-      if (fwrite(buffer, 1, n, stdout) != (size_t)n)
-        return perror("record output"), 3;
-    close(fds[0]);
+    if (!direct_output) {
+      close(fds[1]);
+      char buffer[1 << 16];
+      ssize_t n;
+      while ((n = read(fds[0], buffer, sizeof(buffer))) > 0)
+        if (fwrite(buffer, 1, n, stdout) != (size_t)n)
+          return perror("record output"), 3;
+      close(fds[0]);
+    }
     int status;
     waitpid(pid, &status, 0);
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {

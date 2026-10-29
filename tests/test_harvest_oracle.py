@@ -175,6 +175,23 @@ int operator[](int);
                               cases=200, returns="int", static=True)
         self.assertEqual(report["comparison"]["a vs b"]["differ"], 0)
 
+    def test_case_workers_preserve_seed_order_and_records(self):
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            elf, entry, slot, _, _ = oracle.link(h, "workers", self.objects["o2"], UPDATE, out)
+            plan = oracle.execution_plan(h, elf, entry, UPDATE, {UPDATE}, out)
+            with patch.dict(os.environ, {"ORACLE_WORKERS": "1"}):
+                serial = oracle.execute_range(h, elf, entry, slot, "pf", 11, first=8, plan=plan)
+            actual_run = subprocess.run
+            with patch.dict(os.environ, {"ORACLE_WORKERS": "3"}), patch.object(
+                    oracle.subprocess, "run", wraps=actual_run) as calls:
+                parallel = oracle.execute_range(h, elf, entry, slot, "pf", 11, first=8, plan=plan)
+            shards = [c.args[0][-2:] for c in calls.call_args_list if len(c.args[0]) == 7]
+            self.assertEqual(sorted(shards, key=lambda shard: int(shard[0])), [["8", "4"], ["12", "4"], ["16", "3"]])
+            self.assertEqual([r["seed"] for r in parallel], list(range(8, 19)))
+            self.assertEqual(serial, parallel)
+
     def test_run_cache_uses_execution_inputs_and_file_contents(self):
         h = oracle.Harvest(self.root, "test")
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_CACHE_HOME": directory}):
@@ -228,7 +245,8 @@ int operator[](int);
                     spools.append((stat.st_dev, stat.st_ino))
                 return subprocess_run(*args, **kwargs)
 
-            with patch.object(oracle.subprocess, "run", side_effect=observe_output):
+            with patch.dict(os.environ, {"ORACLE_WORKERS": "1"}), patch.object(
+                    oracle.subprocess, "run", side_effect=observe_output):
                 a = oracle.cached_run(h, elf, entry, slot, "pf", 10, plan=plan)
             b = oracle.cached_run(h, elf, entry, slot, "pf", 10, plan=plan)
             self.assertIsInstance(a.data, mmap.mmap)
@@ -237,6 +255,21 @@ int operator[](int);
             [cached] = (out / "harvest-oracle" / "runs").glob("*.bin")
             stat = cached.stat()
             self.assertEqual(spools, [(stat.st_dev, stat.st_ino)])
+
+    def test_regular_record_output_does_not_relay_through_a_pipe(self):
+        h = oracle.Harvest(self.root, "test")
+        source = self.root / "direct-output.c"
+        source.write_text(Path(oracle.__file__).with_name("harness.c").read_text() +
+                          "\nint forbidden_pipe(int fds[2]) { _exit(77); }\n")
+        harness = self.root / "direct-output"
+        run(["gcc", "-O2", "-fPIE", "-pie", "-Dpipe=forbidden_pipe", str(source), "-o", str(harness), "-lm"])
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            elf, entry, slot, _, _ = oracle.link(h, "direct", self.objects["o2"], UPDATE, out)
+            plan = oracle.execution_plan(h, elf, entry, UPDATE, {UPDATE}, out)
+            with patch.object(oracle, "harness_binary", return_value=harness):
+                records = oracle.execute_range(h, elf, entry, slot, "pf", 3, plan=plan)
+            self.assertEqual([r["seed"] for r in records], [1, 2, 3])
 
     def test_binary_records_retain_legacy_fields_limits_and_write_budget(self):
         source = self.root / "trace.cpp"
@@ -951,6 +984,52 @@ loop_counter: .long 0
         # Overlapping aliases retain the first range's translation.
         aliases = oracle.AddressRanges([(16, 16, 100), (8, 16, 200)])
         self.assertEqual(oracle.translate(17, aliases), 101)
+
+    def test_packed_name_validation_avoids_per_call_unpacking(self):
+        from harvest_oracle import records
+
+        def frame(name):
+            row = [0, name, *([0] * 16), bytes(192)]
+            data = b'{"calls": []}'
+            return records.HEADER.pack(records.MAGIC, len(data), 100, 0) + data + records.CALL.pack(*row) * 100
+
+        with patch.object(records.struct, "unpack_from", side_effect=AssertionError("unpacked each name")):
+            self.assertEqual(len(records.decode_records(frame(0))[0]["calls"]), 100)
+        with self.assertRaisesRegex(ValueError, "invalid oracle call name"):
+            records.decode_records(frame(1))
+
+    def test_packed_prefix_equality_avoids_per_call_unpacking(self):
+        from harvest_oracle.records import CALL, PackedCalls
+
+        def trace(site, count=100, argument=123, target=0x500000):
+            row = [target, 0, argument, 0, 0, 0, 0, 0, *([0] * 8), 0, site, bytes(192)]
+            return {"outcome": "timeout", "detail": "0x0", "writes": [],
+                    "calls": PackedCalls(CALL.pack(*row) * count, [])}
+
+        a, b = trace(100), trace(200, count=101)
+        with patch.object(PackedCalls, "rows", side_effect=AssertionError("unpacked each call")):
+            self.assertEqual(oracle.case_differences(a, b, [], [], {}, {}, {}, "none"), [])
+        for changed in (trace(200, argument=124), trace(200, target=0x600000)):
+            self.assertTrue(oracle.case_differences(a, changed, [], [], {}, {}, {}, "none"))
+        self.assertTrue(oracle.case_differences(a, b, [(123, 1, 500)], [], {}, {}, {}, "none"))
+        self.assertTrue(oracle.case_differences(a, b, [(0x500000, 1, 0x600000)], [], {}, {}, {}, "none"))
+        self.assertTrue(oracle.case_differences({**a, "outcome": "too-many-calls"},
+                                               {**b, "outcome": "too-many-calls"}, [], [], {}, {}, {}, "none"))
+
+    def test_equal_unknown_packed_calls_avoid_diagnostic_decoding(self):
+        from harvest_oracle.records import CALL, PackedCalls
+
+        def trace(site, argument=123, extra=7):
+            row = [0x500000, 0, argument, 8, 9, extra, 0, 0, *([0] * 8), 0, site, bytes(192)]
+            return {"outcome": "too-many-calls", "detail": "0x0", "writes": [],
+                    "calls": PackedCalls(CALL.pack(*row) * 4096, [])}
+
+        a, b = trace(100), trace(200, extra=99)
+        with patch.object(PackedCalls, "__getitem__", side_effect=AssertionError("decoded an equal unknown call")):
+            self.assertEqual(oracle.case_differences(a, b, [], [], {}, {}, {}, "none"), [])
+        self.assertTrue(oracle.case_differences(a, trace(200, argument=124), [], [], {}, {}, {}, "none"))
+        # Equal raw pointers can require different translations in the two versions.
+        self.assertTrue(oracle.case_differences(a, b, [(123, 1, 500)], [], {}, {}, {}, "none"))
 
     def test_only_one_sided_budget_exhaustion_requires_confirmation(self):
         budget = {"outcome": "timeout", "timeout_reason": "instruction-budget"}

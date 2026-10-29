@@ -16,8 +16,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from importlib import resources
 from pathlib import Path
 
@@ -871,6 +873,13 @@ def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_
                          keep_writes=keep_writes, pages=pages)
 
 
+def execution_workers():
+    """Bound concurrent case processes by CPUs and 256 MiB of available memory per lane."""
+    cores = len(os.sched_getaffinity(0))
+    available = int(Path("/proc/meminfo").read_text().split("MemAvailable:")[1].split()[0])
+    return max(1, min(8, cores, available // (256 * 1024), int(os.environ.get("ORACLE_WORKERS", "8"))))
+
+
 def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list="", plan=None, binary=True,
                   output=None, budget=None, keep_writes=True, pages=None):
     thunk, native = slot if isinstance(slot, tuple) else (slot, None)
@@ -902,8 +911,33 @@ def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, gua
     else:
         destination = contextlib.nullcontext(output)
     with destination as output:
-        subprocess.run([str(harness_binary()), str(harvest.image), str(elf), f"0x{entry:x}", spec, str(first),
-                        str(cases)], check=True, stdout=output, stderr=subprocess.PIPE, env=env)
+        command = [str(harness_binary()), str(harvest.image), str(elf), f"0x{entry:x}", spec]
+        workers = min(execution_workers(), cases)
+        if workers <= 1:
+            subprocess.run([*command, str(first), str(cases)], check=True, stdout=output,
+                           stderr=subprocess.PIPE, env=env)
+        else:
+            cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle"
+            cache.mkdir(parents=True, exist_ok=True)
+            with contextlib.ExitStack() as stack:
+                streams = [stack.enter_context(tempfile.TemporaryFile(dir=cache)) for _ in range(workers)]
+                width, extra = divmod(cases, workers)
+                jobs = []
+                for i, stream in enumerate(streams):
+                    start = first + i * width + min(i, extra)
+                    jobs.append((stream, start, width + (i < extra)))
+
+                def run_shard(job):
+                    stream, start, count = job
+                    subprocess.run([*command, str(start), str(count)], check=True, stdout=stream,
+                                   stderr=subprocess.PIPE, env=env)
+
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(run_shard, jobs))
+                for stream in streams:
+                    stream.seek(0)
+                    shutil.copyfileobj(stream, output)
+                output.flush()
         if binary:
             return read_records(output)
         output.seek(0)
@@ -1041,19 +1075,26 @@ def call_identities(calls, names, ranges):
 def call_pairs(a, b, ranges_a, ranges_b, names, signatures):
     """Stream equal known calls without building their diagnostic dictionaries.
 
-    This is only a sufficient equality check. Unknown signatures, translated arguments and unequal
-    captures use the full comparator, including its string, pointer and register-setup rules.
+    This is only a sufficient equality check. Unknown calls check every potentially compared register;
+    translated arguments and unequal captures use the full string, pointer and register-setup rules.
     """
     if not isinstance(a, PackedCalls) or not isinstance(b, PackedCalls):
         yield from zip(a, b)
         return
+    if a.equal_capture_prefix(b):
+        bounds = [r if isinstance(r, AddressRanges) else AddressRanges(r) for r in (ranges_a, ranges_b) if r]
+        lower = min((r.lower for r in bounds), default=0)
+        upper = max((r.upper for r in bounds), default=0)
+        if not any(lower <= value < upper and inside_ranges(value, ranges_a, ranges_b)
+                   for value in a.addresses(min(len(a), len(b)))):
+            return
     rules = {}
     for i, (x, y) in enumerate(zip(a.rows(), b.rows())):
         key = x[:2], y[:2]
         if key not in rules:
             ix = a.names[x[1] - 1].split("@")[0] if x[1] else call_identity({"to": hex(x[0])}, names, ranges_a)
             iy = b.names[y[1] - 1].split("@")[0] if y[1] else call_identity({"to": hex(y[0])}, names, ranges_b)
-            rules[key] = signatures.get(ix) if ix == iy else None
+            rules[key] = signatures.get(ix, (UNKNOWN_GP, UNKNOWN_XMM)) if ix == iy else None
         count = rules[key]
         if count:
             gp, xmm = count
