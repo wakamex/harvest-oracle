@@ -401,6 +401,20 @@ extern "C" int existing() {
         self.assertEqual(oracle.case_differences(a, b, [], [], {}, {}, {}, "none", first_only=True),
                          ["outcome return vs crash"])
 
+    def test_reading_records_keeps_no_descriptor_per_run(self):
+        # A comparison holds thousands of single-seed reruns at once; one descriptor each exhausts the
+        # open-file limit of a service, 1,024 by default.
+        from harvest_oracle.records import HEADER, MAGIC, read_records
+
+        body = json.dumps({"outcome": "return"}).encode()
+        with tempfile.TemporaryFile() as stream:
+            stream.write(HEADER.pack(MAGIC, len(body), 0, 0) + body)
+            stream.flush()
+            before = len(os.listdir("/proc/self/fd"))
+            runs = [read_records(stream) for _ in range(3000)]
+            self.assertEqual(runs[-1][0]["outcome"], "return")
+            self.assertLess(len(os.listdir("/proc/self/fd")) - before, 100)
+
     def test_binary_record_decoder_rejects_truncated_frames(self):
         with self.assertRaises(ValueError):
             oracle.decode_records(b"ORCALL01")

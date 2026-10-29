@@ -92,6 +92,17 @@ def record_json(value):
 
 
 def read_records(stream):
-    """Map a completed run so multi-million-call traces need no whole-run byte copies."""
-    return decode_records(mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ)
-                          if os.fstat(stream.fileno()).st_size else b"")
+    """Map a completed run so multi-million-call traces need no whole-run byte copies.
+
+    Decoded calls keep views into the map, so the map lives as long as the records. A map that kept its own
+    descriptor would leak one per run, and a comparison holding thousands of single-seed reruns would exhaust
+    the process's open-file limit; Python 3.13's untracked maps keep none, and older versions read the run."""
+    fd = stream.fileno()
+    size = os.fstat(fd).st_size
+    if not size:
+        return decode_records(b"")
+    try:
+        data = mmap.mmap(fd, 0, access=mmap.ACCESS_READ, trackfd=False)
+    except TypeError:
+        data = os.pread(fd, size, 0)
+    return decode_records(data)
