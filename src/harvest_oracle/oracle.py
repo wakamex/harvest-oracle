@@ -265,6 +265,7 @@ def execution_plan(harvest, elf, entry, function, follow, out):
             continue
         visited.add(start)
         end = start + extents[start]
+        rows.append(f"F {start:x} {end - start:x}")
         if elf == "-" or start < BASE:
             rows.append(f"R {start:x} {end - start:x}")
         code, addresses = (image_code, image_addresses) if start < BASE else (object_code, object_addresses)
@@ -338,6 +339,53 @@ def execution_plan(harvest, elf, entry, function, follow, out):
     path = out / (Path(elf).stem + ".plan" if elf != "-" else "image.plan")
     path.write_text("\n".join(rows) + "\n")
     return path
+
+
+def apply_guidance(plan, rows):
+    with plan.open("a") as stream:
+        stream.writelines(row + "\n" for row in rows)
+
+
+def guide_plans(harvest, versions, function):
+    """Pool each version's static constants before running any version, including layout reruns."""
+    from . import guidance
+
+    pooled = {}
+    scalar_names = set()
+    for elf, entry, plan in versions:
+        rows = plan.read_text().splitlines()
+        scalar_names.update(row.split()[3] for row in rows if row.startswith("S "))
+        names = dict(harvest.names)
+        if str(elf) != "-":
+            names.update({int(p[0], 16): p[2] for line in run(["nm", str(elf)]).splitlines()
+                          if len(p := line.split()) == 3 and p[1] in "TtWw"})
+        code_by_path = {harvest.image: listing(harvest.image)}
+        if str(elf) != "-":
+            code_by_path[elf] = listing(elf)
+        addresses_by_path = {path: [r[0] for r in code] for path, code in code_by_path.items()}
+        for row in rows:
+            if not row.startswith("F "):
+                continue
+            start, size = (int(v, 16) for v in row.split()[1:])
+            path = harvest.image if start < BASE else elf
+            code = code_by_path[path]
+            addresses = addresses_by_path[path]
+            body = code[bisect.bisect_left(addresses, start):bisect.bisect_left(addresses, start + size)]
+            for key, constants in guidance.comparisons(body, names, memory=start == entry).items():
+                pooled.setdefault(key, set()).update(constants)
+    rows = ["G 1"]
+    for key, constants in sorted(pooled.items()):
+        if key[0] == "S" and key[1] in scalar_names:
+            rows.extend(f"V {key[1]} {constant:x}" for constant in sorted(constants))
+        elif key[0] == "P":
+            rows.append(f"P {key[1]}")
+        elif key[0] == "M":
+            _, base, offset, size = key
+            rows.extend(f"M {base} {offset & ((1 << 64) - 1):x} {size} {constant:x}"
+                        for constant in sorted(constants))
+    for _, _, plan in versions:
+        apply_guidance(plan, rows)
+    return rows
 
 
 def kind_of(type_name):
@@ -1191,15 +1239,12 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                 start, size = harvest.known[function], harvest.sizes[function]
                 stubs, ranges[name] = [], []
                 plan = execution_plan(harvest, "-", start, function, follow, directory)
-                results[name] = cached_image_run(harvest, start, size, spec, cases, plan, keep_writes=bool(out))
                 executions[name] = ("-", start, None, (start, size), "", plan)
                 setups[name] = integer_setups(harvest.image, 0, BASE)
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
                 plan = execution_plan(harvest, elf, entry, function, follow, directory)
                 guard_list = guards(elf)
-                results[name] = cached_run(harvest, elf, entry, slot, spec, cases, guard_list=guard_list, plan=plan,
-                                           keep_writes=bool(out))
                 executions[name] = (elf, entry, slot, None, guard_list, plan)
                 setups[name] = {**integer_setups(harvest.image, 0, BASE), **integer_setups(elf, BASE, 1 << 64)}
                 # The same version with its own data 4 KB further on, for the layout check.
@@ -1208,6 +1253,11 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                 runners[name] = (padded, Path(obj))
             stub_lists[name] = stubs
             describe_callees(stubs, signatures, pointee, string_arguments)
+
+        guidance = guide_plans(harvest, [(e[0], e[1], e[5]) for e in executions.values()], function)
+        for name, (elf, entry, slot, own, guard_list, plan) in executions.items():
+            results[name] = cached_run(harvest, elf, entry, slot, spec, cases, own=own,
+                                       guard_list=guard_list, plan=plan, keep_writes=bool(out))
 
         def differs(a, b, ra, rb, sa=None, sb=None, first_only=False):
             return case_differences(a, b, ra, rb, harvest.names, signatures, pointee, return_kind, sa, sb,
@@ -1249,6 +1299,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         for name, (padded, obj) in runners.items() if suspects else ():
             elf, entry, slot, _, padded_ranges = link(harvest, name, obj, function, padded, pad=True)
             plan = execution_plan(harvest, elf, entry, function, follow, padded)
+            apply_guidance(plan, guidance)
             padded_guards = guards(elf)
             moved = (record for i in suspects
                      for record in execute(harvest, elf, entry, slot, spec, None, plan=plan, seeds=[i + 1],
@@ -1276,6 +1327,6 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                         for r in rs}) for n, rs in results.items()}
     return {"function": function, "signature": signature, "argument_spec": spec, "returns": return_kind,
             "cases": cases, "outcomes": outcomes, "distinct_behaviors": coverage, "named_stubs": stub_lists,
-            "comparison": comparison, "execution_limits": execution_limit_summary(results),
+            "comparison": comparison, "input_guidance": guidance, "execution_limits": execution_limit_summary(results),
             "budget_retries": {f"{reference} vs {other}": [i + 1 for i in indices]
                                for other, indices in budget_retries.items()}}

@@ -84,7 +84,24 @@ static unsigned int page_budget = 400;
 static struct call calls[MAX_CALLS];
 static int call_count;
 static uint64_t return_counter;
-struct scalar_return { uint64_t target; char kind; char *name; };
+struct scalar_return { uint64_t target; char kind; char *name; uint64_t *values; size_t count; };
+struct value_pool { char *name; uint64_t *values; size_t count; };
+static struct value_pool *value_pools;
+static size_t value_pool_count;
+struct memory_rule { char *base; uint64_t offset, key; unsigned int size; uint64_t *values; size_t count; };
+static struct memory_rule *memory_rules;
+static size_t memory_rule_count;
+struct memory_input { uint64_t address, value; unsigned int size; };
+static struct memory_input *memory_inputs;
+static size_t memory_input_count;
+static int guidance_enabled;
+static unsigned int pointer_roots;
+static int guided_seed(void) { return guidance_enabled && (seed & 7) == 4; }
+static uint64_t name_key(const char *name) {
+  uint64_t key = 14695981039346656037UL;
+  while (*name) { key ^= (unsigned char)*name++; key *= 1099511628211UL; }
+  return key;
+}
 static struct scalar_return *scalar_returns;
 static size_t scalar_return_count;
 static int out_fd;
@@ -192,12 +209,68 @@ static inline __attribute__((always_inline)) uint64_t word(uint64_t h) {
   }
 }
 
-static inline __attribute__((always_inline)) uint64_t word_at(uint64_t address) { return word(mix(seed ^ mix(address))); }
+static inline __attribute__((always_inline)) uint64_t word_at(uint64_t address) {
+  // Guided seeds supply empty containers; all other seeds retain the original words.
+  if (guidance_enabled && (seed & 7) == 4)
+    return 0;
+  return word(mix(seed ^ mix(address)));
+}
 
 static void fill(uint64_t page, unsigned char *to) {
   for (uint64_t offset = 0; offset < PAGE; offset += 8) {
     uint64_t w = word_at(page + offset);
     memcpy(to + offset, &w, 8);
+  }
+  for (size_t i = 0; i < memory_input_count; i++) {
+    const struct memory_input *input = &memory_inputs[i];
+    for (unsigned int j = 0; j < input->size; j++)
+      if (input->address + j >= page && input->address + j < page + PAGE)
+        to[input->address + j - page] = input->value >> (8 * j);
+  }
+}
+
+// Resolve fixed entry-relative fields from the deterministic input graph before executing code.
+// Unresolvable paths contribute no overlay. Every version uses the same sorted rules and bytes.
+static uint64_t input_pointer(uint64_t address) {
+  uint64_t result = 0;
+  for (unsigned int i = 0; i < 8; i++) {
+    uint64_t a = address + i;
+    uint64_t w = word_at(a & ~7UL);
+    unsigned char byte = w >> (8 * (a & 7));
+    for (size_t j = 0; j < memory_input_count; j++)
+      if (a >= memory_inputs[j].address && a < memory_inputs[j].address + memory_inputs[j].size)
+        byte = memory_inputs[j].value >> (8 * (a - memory_inputs[j].address));
+    result |= (uint64_t)byte << (8 * i);
+  }
+  return result;
+}
+
+static void prepare_memory_inputs(const struct regs *regs) {
+  if (!guided_seed()) return;
+  if ((seed & 7) == 4)
+    for (unsigned int i = 0; i < 6; i++) {
+      uint64_t address = regs->gp[i];
+      if ((pointer_roots & (1U << i)) && address >= REGION_BASE && address + 8 <= REGION_BASE + REGION_SIZE)
+        memory_inputs[memory_input_count++] = (struct memory_input){address,
+          region_pointer(mix(seed ^ mix(address))), 8};
+    }
+  for (size_t i = 0; i < memory_rule_count; i++) {
+    const struct memory_rule *r = &memory_rules[i];
+    char *rest;
+    if (strncmp(r->base, "arg", 3)) continue;
+    unsigned long arg = strtoul(r->base + 3, &rest, 10);
+    if (arg >= 6) continue;
+    uint64_t pointer = regs->gp[arg];
+    while (*rest == '.' && pointer >= REGION_BASE && pointer < REGION_BASE + REGION_SIZE) {
+      uint64_t offset = strtoll(rest + 1, &rest, 0);
+      if (pointer + offset < REGION_BASE || pointer + offset + 8 > REGION_BASE + REGION_SIZE) break;
+      pointer = input_pointer(pointer + offset);
+    }
+    uint64_t address = pointer + r->offset;
+    if (*rest || address < REGION_BASE || address + r->size > REGION_BASE + REGION_SIZE) continue;
+    uint64_t h = mix(seed ^ mix(address) ^ r->key);
+    memory_inputs[memory_input_count++] = (struct memory_input){address,
+      r->values[(h >> 8) % r->count] + h % 3 - 1, r->size};
   }
 }
 
@@ -257,12 +330,18 @@ static void return_values(struct result *r) {
   r->rax = word(h);
   // Correlate small declared scalar returns within a case so version checks and nested count-controlled
   // loops can all progress. Pointer returns and unidentified boundaries keep their original model.
-  if ((seed & 7) == 0) {
+  if ((seed & 7) == 0 || guided_seed()) {
     const struct call *call = &calls[call_count - 1];
     for (size_t i = 0; i < scalar_return_count; i++) {
       const struct scalar_return *s = &scalar_returns[i];
       if (call->name ? strcmp(call->name, s->name) == 0 : call->target == s->target) {
-        r->rax = s->kind == 'b' ? (h >> 8) & 1 : (int64_t)((h >> 8) % 5) - 1;
+        if (guided_seed() && s->count) {
+          uint64_t choice = mix(h ^ name_key(s->name));
+          r->rax = s->values[(choice >> 8) % s->count] + (choice % 3) - 1;
+          if (s->kind == 'b') r->rax = !!r->rax;
+        } else {
+          r->rax = s->kind == 'b' ? (h >> 8) & 1 : (int64_t)((h >> 8) % 5) - 1;
+        }
         break;
       }
     }
@@ -601,6 +680,28 @@ static int branch_trap(ucontext_t *uc) {
   return 0;
 }
 
+// A probe is private to the forked case, so restoring its byte counts each block once per case.
+struct coverage_probe { uint64_t address; unsigned char original, hit; };
+static struct coverage_probe *coverage_probes;
+static size_t coverage_count;
+
+static int coverage_trap(ucontext_t *uc) {
+  uint64_t address = uc->uc_mcontext.gregs[REG_RIP] - 1;
+  for (size_t i = 0; i < coverage_count; i++) {
+    struct coverage_probe *p = &coverage_probes[i];
+    if (p->address != address || p->hit)
+      continue;
+    p->hit = 1;
+    set_byte(address, p->original);
+    // A data guard or transfer breakpoint at the same address still needs its usual handler.
+    if (p->original == 0xcc)
+      return 0;
+    uc->uc_mcontext.gregs[REG_RIP] = address;
+    return 1;
+  }
+  return 0;
+}
+
 static void load_plan(const char *path) {
   FILE *f = fopen(path, "r");
   if (!f) {
@@ -620,7 +721,46 @@ static void load_plan(const char *path) {
   char line[512];
   while (fgets(line, sizeof(line), f)) {
     unsigned long size;
-    if (sscanf(line, "R %lx %lx", &start, &size) == 2) {
+    if (line[0] == 'G') {
+      guidance_enabled = 1;
+    } else if (line[0] == 'P') {
+      unsigned int arg;
+      if (sscanf(line, "P arg%u", &arg) != 1 || arg >= 6) exit(1);
+      pointer_roots |= 1U << arg;
+    } else if (line[0] == 'V') {
+      char name[480];
+      unsigned long value;
+      if (sscanf(line, "V %479s %lx", name, &value) != 2) exit(1);
+      size_t i = 0;
+      while (i < value_pool_count && strcmp(value_pools[i].name, name)) i++;
+      if (i == value_pool_count) {
+        value_pools = realloc(value_pools, ++value_pool_count * sizeof(*value_pools));
+        value_pools[i] = (struct value_pool){.name = strdup(name)};
+      }
+      struct value_pool *p = &value_pools[i];
+      p->values = realloc(p->values, (p->count + 1) * sizeof(*p->values));
+      p->values[p->count++] = value;
+    } else if (line[0] == 'M') {
+      char base[400];
+      unsigned long offset, value;
+      unsigned int width;
+      if (sscanf(line, "M %399s %lx %u %lx", base, &offset, &width, &value) != 4 ||
+          (width != 1 && width != 2 && width != 4)) exit(1);
+      size_t i = 0;
+      while (i < memory_rule_count && (strcmp(memory_rules[i].base, base) ||
+             memory_rules[i].offset != offset || memory_rules[i].size != width)) i++;
+      if (i == memory_rule_count) {
+        memory_rules = realloc(memory_rules, ++memory_rule_count * sizeof(*memory_rules));
+        memory_rules[i] = (struct memory_rule){.base = strdup(base), .offset = offset, .size = width,
+                                             .key = name_key(base) ^ mix(offset) ^ width};
+      }
+      struct memory_rule *p = &memory_rules[i];
+      p->values = realloc(p->values, (p->count + 1) * sizeof(*p->values));
+      p->values[p->count++] = value;
+    } else if (sscanf(line, "C %lx", &start) == 1) {
+      coverage_probes = realloc(coverage_probes, (coverage_count + 1) * sizeof(*coverage_probes));
+      coverage_probes[coverage_count++] = (struct coverage_probe){.address = start};
+    } else if (sscanf(line, "R %lx %lx", &start, &size) == 2) {
       if (start < image_text_start || start + size > image_text_end)
         exit(1);
       memcpy((void *)start, original + start - image_text_start, size);
@@ -657,6 +797,13 @@ static void load_plan(const char *path) {
     }
   }
   fclose(f);
+  for (size_t i = 0; i < scalar_return_count; i++)
+    for (size_t j = 0; j < value_pool_count; j++)
+      if (strcmp(scalar_returns[i].name, value_pools[j].name) == 0) {
+        scalar_returns[i].values = value_pools[j].values;
+        scalar_returns[i].count = value_pools[j].count;
+      }
+  memory_inputs = calloc(memory_rule_count + 6, sizeof(*memory_inputs));
   free(original);
   mprotect((void *)image_text_start, image_text_end - image_text_start, PROT_READ);
   // Each restored range gets execute permission, with masked neighbours still trapping.
@@ -686,7 +833,7 @@ static void handler(int signal, siginfo_t *info, void *context) {
     timeout_reason = "instruction-budget";
     finish("timeout", rip, NULL);
   }
-  if (signal == SIGTRAP && (guard_trap(uc) || loop_trap(uc) || branch_trap(uc)))
+  if (signal == SIGTRAP && (coverage_trap(uc) || guard_trap(uc) || loop_trap(uc) || branch_trap(uc)))
     return;
   // A call or jump out of the image function under test lands on the int3 filling the rest of its pages.
   if (signal == SIGTRAP && rip - 1 >= image_text_start && rip - 1 < image_text_end && !runnable_image(rip - 1)) {
@@ -849,6 +996,16 @@ static void finish(const char *outcome, uint64_t detail, const struct result *re
   n += sprintf(line + n, "],\"pages\":%d", page_count);
   n += sprintf(line + n, ",\"execution_limit\":{\"mode\":\"%s\",\"budget\":%lu,\"error\":%d,\"pages\":%u}",
                instruction_fd >= 0 ? "instructions" : "wall-clock", instruction_budget, instruction_error, page_budget);
+  if (coverage_count) {
+    n += sprintf(line + n, ",\"blocks\":[");
+    int separator = 0;
+    for (size_t i = 0; i < coverage_count; i++)
+      if (coverage_probes[i].hit) {
+        n += sprintf(line + n, "%s\"0x%lx\"", separator ? "," : "", coverage_probes[i].address);
+        separator = 1;
+      }
+    n += sprintf(line + n, "]");
+  }
   if (measure_instructions)
     n += sprintf(line + n, ",\"instructions\":%lu", instructions);
   if (strcmp(outcome, "timeout") == 0)
@@ -1076,6 +1233,11 @@ int main(int argc, char **argv) {
   sigaction(SIGALRM, &sa, NULL);
   sigaction(SIGTRAP, &sa, NULL);
 
+  for (size_t i = 0; i < coverage_count; i++) {
+    coverage_probes[i].original = *(unsigned char *)coverage_probes[i].address;
+    set_byte(coverage_probes[i].address, 0xcc);
+  }
+
   for (uint64_t s = first; s < first + count; s++) {
     int fds[2];
     pipe(fds);
@@ -1103,6 +1265,7 @@ int main(int argc, char **argv) {
       for (; xmm < 8; xmm++) {
         regs.xmm[xmm] = POISON;
       }
+      prepare_memory_inputs(&regs);
       alarm(2);
       struct result result;
       start_counter(1);

@@ -18,6 +18,10 @@ from harvest_oracle import oracle
 TIME = "ox/algo/CTimeCounter.cpp"
 SPRITE = "daisy/video/Null/CSpritePackage.cpp"
 COLOR = "daisy/video/Null/CColorConverter.cpp"
+BSP = "daisy/scene/CBspTree.cpp"
+SPLITTER = "_ZN5daisy5scene8CBspTree12findSplitterEPNS1_7BspPolyEjRN2ox4core8CPlane3dIfEE"
+DROP = "HarvestFull/harvest/entity/CDropshipEntity.cpp"
+UPDATE = "_ZN7harvest6entity15CDropshipEntity11updateLogicEf"
 LOAD = "_ZN5daisy5video14CSpritePackage4loadEPN2ox2io9IReadFileEPKc"
 
 # Each replacement must occur exactly once in the recovered translation unit. The expected behavior
@@ -49,6 +53,42 @@ MUTATIONS = [
     ("independent-load-statements", SPRITE, LOAD, "bool", False, True,
      "    HeaderSize = SPRITE_PACKAGE_HEADER_SIZE;\n    TextureDataSize = TextureSize * TextureSize;",
      "    TextureDataSize = TextureSize * TextureSize;\n    HeaderSize = SPRITE_PACKAGE_HEADER_SIZE;"),
+    ('load-version', SPRITE, LOAD, 'bool', False, False,
+     'if (version > 3)', 'if (version >= 3)'),
+    ('load-header', SPRITE, LOAD, 'bool', False, False,
+     'HeaderSize = SPRITE_PACKAGE_HEADER_SIZE;', 'HeaderSize = SPRITE_PACKAGE_HEADER_SIZE + 1;'),
+    ('load-texture-scale', SPRITE, LOAD, 'bool', False, False,
+     'TextureDataSize *= 3;', 'TextureDataSize *= 2;'),
+    ('splitter-score', BSP, SPLITTER, 'bool', False, False,
+     '\t\t\tint score = abs(frontCount - backCount) + (splitCount*3) + planarCount;', '\t\t\tint score = abs(frontCount - backCount) + (splitCount*2) + planarCount;'),
+    ('splitter-store', BSP, SPLITTER, 'bool', False, False,
+     'bestSplitter->wasSplitter = true;', 'bestSplitter->wasSplitter = false;'),
+    ('splitter-empty', BSP, SPLITTER, 'bool', False, False,
+     'if (!bestSplitter)\n\t\treturn false;', 'if (!bestSplitter)\n\t\treturn true;'),
+    ('drop-laugh-state', DROP, UPDATE, 'int', False, False,
+     'LaughCooldown > 0 && State == 1', 'LaughCooldown > 0 && State == 2'),
+    ('drop-landing-tag', DROP, UPDATE, 'int', False, False,
+     'else if (State == 2)', 'else if (State == 7)'),
+    ('drop-sprite', DROP, UPDATE, 'int', False, False,
+     'SpriteIndex = 72;', 'SpriteIndex = 71;'),
+    ('remaining-field', TIME, "_ZN2ox4algo12CTimeCounter16getRemainingTimeEv", 'float', False, False,
+     'return Remaining;', 'return Delay;'),
+    ('inverted-progress', TIME, "_ZN2ox4algo12CTimeCounter19getInvertedProgressEv", 'float', False, False,
+     'return Remaining / Delay;', 'return Delay / Remaining;'),
+    ('put-delay', TIME, "_ZN2ox4algo12CTimeCounter8putDelayEff", 'none', False, False,
+     'Remaining += time;', 'Remaining = time;'),
+    ('override-field', TIME, "_ZN2ox4algo12CTimeCounter21overrideStartingValueEf", 'none', False, False,
+     'void CTimeCounter::overrideStartingValue(float delay)\n{\n    Delay = delay;', 'void CTimeCounter::overrideStartingValue(float delay)\n{\n    Remaining = delay;'),
+    ('update-subtract', TIME, "_ZN2ox4algo12CTimeCounter13updateCounterEf", 'bool', False, False,
+     'Remaining -= frameDelta;', 'Remaining += frameDelta;'),
+    ('remaining-parentheses', TIME, "_ZN2ox4algo12CTimeCounter16getRemainingTimeEv", 'float', False, True,
+     'return Remaining;', 'return (Remaining);'),
+    ('progress-parentheses', TIME, "_ZN2ox4algo12CTimeCounter11getProgressEv", 'float', False, True,
+     'return 1.0f - Remaining / Delay;', 'return 1.0f - (Remaining / Delay);'),
+    ('splitter-declarations', BSP, SPLITTER, 'bool', False, True,
+     'unsigned int frontCount = 0;\n\t\tunsigned int backCount = 0;', 'unsigned int backCount = 0;\n\t\tunsigned int frontCount = 0;'),
+    ('drop-increment', DROP, UPDATE, 'int', False, True,
+     '++LaughIndex;', 'LaughIndex += 1;'),
 ]
 
 
@@ -107,7 +147,7 @@ def measure(harvest, output, label, cases, keep):
                               out=destination / mutation["name"] if keep else None)
         comparison = report["comparison"]["original vs mutation"]
         row = {"name": mutation["name"], "preserving": mutation["preserving"],
-               "verdict": "differ" if comparison["differ"] else "agree", "seconds": time.perf_counter() - start,
+               "verdict": "differ" if comparison["differ"] else "agree", "differing_cases": comparison["differ"], "seconds": time.perf_counter() - start,
                "report": report}
         rows.append(row)
         with (destination / "results.jsonl").open("a") as stream:
