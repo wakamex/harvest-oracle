@@ -151,16 +151,46 @@ class Harvest:
 
     def return_kind(self, signature):
         """The return type of a member function from its declarations in src/, when they agree."""
+        method = self.method_name(signature)
+        if re.fullmatch(r"\w+", method):
+            kinds = {kind_of(t.replace(" ", "")) for t in self.return_types.get(method, ())
+                     if re.fullmatch(r"[\w:<>]+\s*\**", t)}
+        else:
+            # Operators and other compound names retain the entry return reader's existing spelling rules.
+            pattern = re.compile(rf"^\s*(?:static\s+|virtual\s+|inline\s+)*([\w:<>]+\s*\**)\s+{re.escape(method)}\s*\(")
+            kinds = {kind_of(m[1].replace(" ", "")) for header in (self.root / "src").rglob("*.h")
+                     for line in header.read_text(errors="replace").splitlines() if (m := pattern.match(line))}
+        return kinds.pop() if len(kinds) == 1 else "none"
+
+    @staticmethod
+    def method_name(signature):
         head = signature.split("(")[0]
-        method = head.rsplit("::", 1)[-1]
-        kinds = set()
-        pattern = re.compile(rf"^\s*(?:static\s+|virtual\s+|inline\s+)*([\w:<>]+\s*\**)\s+{re.escape(method)}\s*\(")
+        return head.rsplit("::", 1)[-1]
+
+    @functools.cached_property
+    def return_types(self):
+        """Conservative declaration index shared by entry comparison and boundary generation.
+
+        Preserve pointer spelling: entry comparison uses integer registers for pointers too, whereas
+        scalar-return generation must never turn a declared pointer return into a small integer.
+        """
+        types = {}
+        pattern = re.compile(r"^\s*(?:static\s+|virtual\s+|inline\s+)*"
+                             r"((?:(?:const|unsigned|signed|long)\s+)*[\w:<>]+(?:\s*[*&])*)\s+(\w+)\s*\(")
         for header in (self.root / "src").rglob("*.h"):
             for line in header.read_text(errors="replace").splitlines():
                 m = pattern.match(line)
                 if m:
-                    kinds.add(kind_of(m.group(1).replace(" ", "")))
-        return kinds.pop() if len(kinds) == 1 else "none"
+                    types.setdefault(m[2], set()).add(m[1])
+        return types
+
+    def scalar_return_kind(self, signature):
+        types = {t.replace(" ", "") for t in self.return_types.get(self.method_name(signature), ())}
+        if types == {"bool"}:
+            return "b"
+        if types and types <= {"int", "s32", "u32", "unsignedint", "long", "u64", "s64"}:
+            return "i"
+        return None
 
     @property
     def vague_functions(self):
@@ -292,6 +322,19 @@ def execution_plan(harvest, elf, entry, function, follow, out):
                     else:
                         raise ValueError(f"{function}: unsupported indirect transfer at {address:x}: {arg}")
                 rows.append(f"B {address:x} {address + length:x} {target:x} {base} {index} {scale} {displacement & ((1 << 64) - 1):x} {memory} {int(op.startswith('call'))} {start:x} {end:x}")
+    # Only identified boundaries receive a scalar model. Indirect calls with generated targets and
+    # ambiguous or missing declarations keep the original return distribution.
+    targets = {int(row.split()[3], 16) for row in rows if row.startswith(("B ", "D "))
+               and int(row.split()[3], 16)}
+    candidates = {harvest.names[a]: a for a in targets if a in harvest.names}
+    if elf != "-":
+        for line in run(["nm", str(elf)]).splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[1] in "TtWw" and parts[2] not in own:
+                candidates[parts[2]] = int(parts[0], 16)
+    for name, signature in zip(candidates, demangle(list(candidates))):
+        if kind := harvest.scalar_return_kind(signature):
+            rows.append(f"S {candidates[name]:x} {kind} {name}")
     path = out / (Path(elf).stem + ".plan" if elf != "-" else "image.plan")
     path.write_text("\n".join(rows) + "\n")
     return path
@@ -916,9 +959,13 @@ def cached_run(harvest, elf, entry, slot, spec, cases, own=None, guard_list="", 
 
 
 def inside_ranges(value, *range_lists):
-    return any(start <= value < start + size for ranges in range_lists
-               if not isinstance(ranges, AddressRanges) or ranges.may_contain(value)
-               for start, size, _ in ranges)
+    for ranges in range_lists:
+        if isinstance(ranges, AddressRanges) and not ranges.may_contain(value):
+            continue
+        for start, size, _ in ranges:
+            if start <= value < start + size:
+                return True
+    return False
 
 
 def call_identity(call, names, ranges=()):
@@ -1150,9 +1197,10 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
                 plan = execution_plan(harvest, elf, entry, function, follow, directory)
-                results[name] = cached_run(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf), plan=plan,
+                guard_list = guards(elf)
+                results[name] = cached_run(harvest, elf, entry, slot, spec, cases, guard_list=guard_list, plan=plan,
                                            keep_writes=bool(out))
-                executions[name] = (elf, entry, slot, None, guards(elf), plan)
+                executions[name] = (elf, entry, slot, None, guard_list, plan)
                 setups[name] = {**integer_setups(harvest.image, 0, BASE), **integer_setups(elf, BASE, 1 << 64)}
                 # The same version with its own data 4 KB further on, for the layout check.
                 padded = directory / "padded"
@@ -1201,11 +1249,12 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         for name, (padded, obj) in runners.items() if suspects else ():
             elf, entry, slot, _, padded_ranges = link(harvest, name, obj, function, padded, pad=True)
             plan = execution_plan(harvest, elf, entry, function, follow, padded)
-            moved = [record for i in suspects
+            padded_guards = guards(elf)
+            moved = (record for i in suspects
                      for record in execute(harvest, elf, entry, slot, spec, None, plan=plan, seeds=[i + 1],
-                                           guard_list=guards(elf), budget=instruction_budget() *
+                                           guard_list=padded_guards, budget=instruction_budget() *
                                            (RETRY_MULTIPLIER if i in retry_indices else 1), keep_writes=bool(out),
-                                           pages=MAX_PAGES if i in retry_indices else page_budget())]
+                                           pages=MAX_PAGES if i in retry_indices else page_budget()))
             for i, again in zip(suspects, moved):
                 if differs(results[name][i], again, ranges[name], padded_ranges, first_only=True):
                     layout_dependent.add(i)

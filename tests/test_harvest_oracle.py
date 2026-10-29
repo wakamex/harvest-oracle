@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import resource
 import subprocess
 import sys
 import tempfile
@@ -102,6 +103,72 @@ class SyntheticCheckout(unittest.TestCase):
 
     def test_comparison_that_differs_only_on_nan_is_caught(self):
         self.assertGreater(self.check("o2", "nan")["differ"], 0)
+
+    def test_dependent_reads_behind_scalar_gates_are_exercised(self):
+        (self.root / 'src').mkdir(exist_ok=True)
+        (self.root / 'src' / 'reads.h').write_text('int nextValue();\n')
+        source = '''extern int nextValue();
+int dependentReads() {
+  if (nextValue() != 2) return 0;
+  int first = nextValue();
+  if (first < 0 || first > 3) return 0;
+  int second = nextValue();
+  if (second < 0 || second > 3) return 0;
+  int columns = nextValue();
+  int count = nextValue();
+  if (count < 0 || count > 3) return 0;
+  return columns + 7 * count;
+}
+'''
+        swapped = source.replace('int columns = nextValue();\n  int count = nextValue();',
+                                 'int count = nextValue();\n  int columns = nextValue();')
+        versions = {}
+        for name, text in (("original", source), ("renamed", source.replace("columns", "width")),
+                           ("swapped", swapped)):
+            path = self.root / f"reads-{name}.cpp"
+            path.write_text(text)
+            obj = path.with_suffix('.o')
+            run(['g++', '-O2', '-fno-pic', '-c', str(path), '-o', str(obj)])
+            versions[name] = obj
+        report = oracle.check(oracle.Harvest(self.root, "test"), '_Z14dependentReadsv', versions,
+                              cases=500, returns="int", static=True)
+        self.assertEqual(report["comparison"]["original vs renamed"]["differ"], 0)
+        self.assertGreater(report["comparison"]["original vs swapped"]["differ"], 0)
+
+    def test_layout_reruns_release_each_record_before_next_seed(self):
+        versions = {}
+        for value in (0, 1):
+            path = self.root / f'constant-{value}.cpp'
+            path.write_text(f'int constantValue() {{ return {value}; }}')
+            obj = path.with_suffix('.o')
+            run(['g++', '-O2', '-fno-pic', '-c', str(path), '-o', str(obj)])
+            versions[str(value)] = obj
+        limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, limit[1]))
+            report = oracle.check(oracle.Harvest(self.root, 'test'), '_Z13constantValuev', versions,
+                                  cases=80, returns='int', static=True)
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, limit)
+        self.assertEqual(report['comparison']['0 vs 1']['differ'], 80)
+
+    def test_scalar_return_declarations_exclude_pointer_and_ambiguous_types(self):
+        (self.root / 'src').mkdir(exist_ok=True)
+        (self.root / 'src' / 'return-model.h').write_text('''int scalarValue();
+bool flagValue();
+int* pointerValue();
+const char* mixedValue();
+int mixedValue(int);
+unsigned int unsignedValue();
+int operator[](int);
+''')
+        h = oracle.Harvest(self.root, 'test')
+        self.assertEqual(h.scalar_return_kind('scalarValue()'), 'i')
+        self.assertEqual(h.scalar_return_kind('flagValue()'), 'b')
+        self.assertEqual(h.scalar_return_kind('unsignedValue()'), 'i')
+        for name in ('pointerValue()', 'mixedValue()', 'undeclaredValue()'):
+            self.assertIsNone(h.scalar_return_kind(name))
+        self.assertEqual(h.return_kind('Thing::operator[](int)'), 'int')
 
     def test_object_agrees_with_the_executables_own_code_run_in_place(self):
         report = oracle.check(oracle.Harvest(self.root, "test"), UPDATE, {"a": self.objects["o2"], "b": "image"},

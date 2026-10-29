@@ -84,6 +84,9 @@ static unsigned int page_budget = 400;
 static struct call calls[MAX_CALLS];
 static int call_count;
 static uint64_t return_counter;
+struct scalar_return { uint64_t target; char kind; char *name; };
+static struct scalar_return *scalar_returns;
+static size_t scalar_return_count;
 static int out_fd;
 static int binary_records, compare_only;
 static int instruction_fd = -1, instruction_error;
@@ -252,6 +255,18 @@ static int local(uint64_t a) {
 static void return_values(struct result *r) {
   uint64_t h = mix(seed ^ mix(0x5eed0000UL + return_counter++));
   r->rax = word(h);
+  // Correlate small declared scalar returns within a case so version checks and nested count-controlled
+  // loops can all progress. Pointer returns and unidentified boundaries keep their original model.
+  if ((seed & 7) == 0) {
+    const struct call *call = &calls[call_count - 1];
+    for (size_t i = 0; i < scalar_return_count; i++) {
+      const struct scalar_return *s = &scalar_returns[i];
+      if (call->name ? strcmp(call->name, s->name) == 0 : call->target == s->target) {
+        r->rax = s->kind == 'b' ? (h >> 8) & 1 : (int64_t)((h >> 8) % 5) - 1;
+        break;
+      }
+    }
+  }
   r->rdx = word(mix(h));
   r->xmm0 = ((h >> 20) & 1) ? doubles[(h >> 21) & 7] : floats[(h >> 21) & 15];
   r->xmm1 = POISON;  // only float structs return in xmm1; for every other call it is clobbered
@@ -623,6 +638,12 @@ static void load_plan(const char *path) {
         exit(1);
       plt_address[plt_count] = start;
       plt_name[plt_count++] = strdup(name);
+    } else if (line[0] == 'S') {
+      char kind, name[480];
+      if (sscanf(line, "S %lx %c %479s", &start, &kind, name) != 3 || (kind != 'i' && kind != 'b'))
+        exit(1);
+      scalar_returns = realloc(scalar_returns, (scalar_return_count + 1) * sizeof(*scalar_returns));
+      scalar_returns[scalar_return_count++] = (struct scalar_return){start, kind, strdup(name)};
     } else if (line[0] == 'B' || line[0] == 'D') {
       struct branch b = {0};
       b.direct = line[0] == 'D';

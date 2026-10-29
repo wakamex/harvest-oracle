@@ -21,6 +21,8 @@ For each case:
 - the ordered boundary calls from the function and its followed callees with their arguments, up to the callee's known parameter count from its mangled name or C API signature
 - every 8-byte word written to generated memory or to the executable's globals, for cases that return
 
+One eighth of seeds generate a recognized integer boundary return from -1, 0, 1, 2 and 3, and a recognized boolean return from 0 and 1, keyed by the seed and call position. Keeping these returns small throughout a case lets several version checks and count-controlled loops progress together. Other seeds retain the pointer, integer, floating-point and arbitrary-word return distribution. Floating-point return registers and allocator results retain their existing generation rules. The execution plan identifies direct and named scalar boundaries from unambiguous return declarations under `src/`. Pointer returns, ambiguous or missing declarations and unidentified indirect calls retain the original distribution. The harness does not infer output parameters or modify memory behind boundary arguments.
+
 Followed calls themselves add no trace event and consume no generated return value. Their boundary calls and writes are compared as though their bodies had been inlined. Stack writes remain uncompared. Known code pointers in an object are translated to their executable addresses, including indirect-call targets. Known string parameters of the [Lua 5.1 C API](https://www.lua.org/manual/5.1/manual.html) and the [GNU C Library (glibc)](https://www.gnu.org/software/libc/) string functions use their parameter rules: counted strings compare their declared length, and zero-terminated strings compare through the terminator.
 
 When both versions time out, only their completed common call prefix is compared. A different target or argument within that prefix remains a difference; the longer trace's unmatched tail and either version's writes cannot establish a difference because the instruction limit can stop differently compiled versions at different points, and the alarm backstop depends on elapsed time. When only one version exhausts its page or instruction budget and another returns, faults or reaches the call limit, every version reruns that seed with the original 8,192-page cap and 100 times the instruction allowance before comparison. A persistent timeout against another outcome remains a difference.
@@ -120,3 +122,13 @@ The tests build fixed-address executables and compare equivalent compiles, inlin
 ## License
 
 MIT
+
+## Mutation benchmark
+
+`benchmarks/mutations.py` compiles real Harvest functions with the checkout's pinned GCC 4.4.3 toolchain and read-only source overlays. Build Harvest's match objects first. The benchmark includes swapped dependent reads, a changed constant, a dropped store, a changed comparison, an off-by-one loop bound and a NaN-only comparison, plus independent statement reordering, local renaming and outlining controls. Its expected behavior labels come from the source changes. A mutation is detected when at least one case differs; the false-difference rate counts preserving rewrites with any differing case.
+
+```
+uv run --locked python benchmarks/mutations.py --harvest /path/to/harvest --output /path/to/evidence --label current --keep
+```
+
+All generated sources, compiler metadata, input hashes, objects and results stay in the output directory, which must be outside this repository. `--keep` also exports the per-case records. `--build-only` prepares the inputs; `--run-only` reuses and verifies their hashes so different oracle revisions can measure the same objects. `--cases` defaults to 5,000 per pair. The result includes differing-case counts and diagnostic examples for each rewrite, and separate mutation detection and false-difference rates. This fixed collection measures sensitivity to these changes rather than estimating sensitivity across all Harvest code.
