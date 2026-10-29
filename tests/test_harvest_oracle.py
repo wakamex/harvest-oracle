@@ -137,6 +137,151 @@ class SyntheticCheckout(unittest.TestCase):
         self.assertEqual(line["cases"], 50)
 
 
+class FollowedFunctions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.scratch = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.scratch.name)
+        cls.build = cls.root / "orig" / "test"
+        cls.build.mkdir(parents=True)
+        (cls.root / "config" / "test").mkdir(parents=True)
+        cls.source = r"""
+extern "C" int boundary(int);
+extern "C" __attribute__((noinline)) int boundary(int n) { return n; }
+#ifdef INLINE
+#define HELPER inline __attribute__((always_inline))
+#else
+#define HELPER __attribute__((weak, noinline))
+#endif
+HELPER int helper(int *p) { *p = *p + 3; return boundary(*p); }
+__attribute__((noinline)) static int local(int *p) { *p = *p + 2; return helper(p); }
+int work(int *p) { return local(p); }
+int indirect(int *p, int (*f)(int *)) { return f(p); }
+__attribute__((noinline)) int recursive(int *p, bool stop) { if (stop) return *p; return recursive(p, true) + 1; }
+__attribute__((noinline)) void traphelper() { __asm__("int3"); }
+void trapping() { traphelper(); }
+extern "C" void _start() { for (;;) {} }
+"""
+        # The boundary's body belongs to another unit for the versions being checked.
+        (cls.root / "image.cpp").write_text(cls.source)
+        run(["g++", "-O1", "-static", "-no-pie", "-fno-pic", "-nostdlib", "-Wl,-Ttext-segment=0x400000",
+             "-o", str(cls.build / "Harvest"), str(cls.root / "image.cpp")])
+        symbols = ["address\tsize\tsymbol\tevidence"]
+        for line in run(["nm", "-S", str(cls.build / "Harvest")]).splitlines():
+            parts = line.split()
+            if len(parts) == 4:
+                symbols.append(f"0x{int(parts[0], 16):x}\t{int(parts[1], 16)}\t{parts[3]}\ttest")
+        (cls.root / "config" / "test" / "symbols.tsv").write_text("\n".join(symbols) + "\n")
+        cls.objects = {}
+        for name in ("inline", "outline", "changed"):
+            source = cls.source.replace('extern "C" __attribute__((noinline)) int boundary(int n) { return n; }', '')
+            if name == "changed":
+                source = source.replace('*p + 3', '*p + 4')
+            path = cls.root / f"{name}.cpp"
+            path.write_text(source)
+            obj = path.with_suffix('.o')
+            run(["g++", "-O1", "-fno-pic", *(["-DINLINE"] if name == "inline" else []), "-c", str(path), "-o", str(obj)])
+            cls.objects[name] = obj
+        weak = cls.root / 'build' / 'match' / 'test' / 'unit.o'
+        weak.parent.mkdir(parents=True)
+        weak.write_bytes(cls.objects['outline'].read_bytes())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.scratch.cleanup()
+
+    def test_same_unit_helpers_execute_and_preserve_external_boundary(self):
+        out = self.root / "records"
+        report = oracle.check(oracle.Harvest(self.root, "test"), "_Z4workPi",
+                              {**self.objects, "original": "image"}, cases=100, returns="int", static=True, out=out)
+        for pair in ("inline vs outline", "inline vs original"):
+            self.assertEqual(report["comparison"][pair]["differ"], 0)
+        self.assertGreater(report["comparison"]["inline vs changed"]["differ"], 0)
+        records = [json.loads(line) for line in (out / "outline.jsonl").read_text().splitlines()]
+        self.assertTrue(all(len(r['calls']) == 1 for r in records))
+        self.assertTrue(all(r['writes'] for r in records))
+
+    def test_weak_body_from_another_object_runs_in_image(self):
+        # The called body is absent from the version, but weak in another built object.
+        source = self.root / 'weak.cpp'
+        source.write_text('__attribute__((weak)) int helper(int *p) { *p += 3; return *p; }')
+        obj = self.root / 'build' / 'match' / 'test' / 'weak.o'
+        obj.parent.mkdir(parents=True, exist_ok=True)
+        run(['g++', '-O1', '-c', str(source), '-o', str(obj)])
+        caller = self.root / 'fallback.cpp'
+        caller.write_text('int helper(int *); int fallback(int *p) { return helper(p); }')
+        run(['g++', '-O1', '-fno-pic', '-c', str(caller), '-o', str(caller.with_suffix('.o'))])
+        h = oracle.Harvest(self.root, 'test')
+        with tempfile.TemporaryDirectory() as directory:
+            elf, entry, slot, _, _ = oracle.link(h, 'v', caller.with_suffix('.o'), '_Z8fallbackPi', Path(directory))
+            plan = oracle.execution_plan(h, elf, entry, '_Z8fallbackPi', h.vague_functions, Path(directory))
+            records = oracle.execute(h, elf, entry, slot, 'p', 20, plan=plan)
+        self.assertTrue(all(r['writes'] for r in records))
+        self.assertTrue(all(len(r['calls']) == 1 for r in records))  # helper's boundary, rather than helper
+        self.assertTrue(all(int(r['calls'][0]['to'], 16) == h.known['boundary'] for r in records))
+
+    def test_indirect_call_stays_recorded_when_target_is_followed(self):
+        source = self.root / 'dispatch.cpp'
+        source.write_text('int helper(int *p) { *p += 3; return *p; } '
+                          'int dispatch(int *p) { int (*volatile f)(int *) = helper; return f(p); }')
+        obj = source.with_suffix('.o')
+        run(['g++', '-O1', '-fno-pic', '-c', str(source), '-o', str(obj)])
+        out = self.root / 'indirect-records'
+        oracle.check(oracle.Harvest(self.root, 'test'), '_Z8dispatchPi', {'v': obj}, cases=20,
+                     returns='int', static=True, out=out)
+        records = [json.loads(l) for l in (out / 'v.jsonl').read_text().splitlines()]
+        self.assertTrue(all(len(r['calls']) == 1 and not r['writes'] for r in records))
+
+    def test_image_fallback_calls_the_versions_own_definition(self):
+        source = self.root / 'redirect.cpp'
+        source.write_text('int helper(int *); extern "C" int boundary(int n) { return n + 1; } '
+                          'int redirect(int *p) { return helper(p); }')
+        obj = source.with_suffix('.o')
+        run(['g++', '-O1', '-fno-pic', '-c', str(source), '-o', str(obj)])
+        out = self.root / 'redirect-records'
+        oracle.check(oracle.Harvest(self.root, 'test'), '_Z8redirectPi', {'v': obj}, cases=20,
+                     returns='int', static=True, out=out)
+        records = [json.loads(l) for l in (out / 'v.jsonl').read_text().splitlines()]
+        self.assertTrue(all(r['outcome'] == 'return' and not r['calls'] and r['writes'] for r in records))
+
+    def test_allocator_body_stays_a_boundary(self):
+        source = self.root / 'allocator.cpp'
+        source.write_text('extern "C" __attribute__((noinline)) void *malloc(unsigned long n) { return 0; } '
+                          'void *allocate() { return malloc(8); }')
+        obj = source.with_suffix('.o')
+        run(['g++', '-O1', '-fno-pic', '-fno-builtin', '-c', str(source), '-o', str(obj)])
+        out = self.root / 'allocator-records'
+        oracle.check(oracle.Harvest(self.root, 'test'), '_Z8allocatev', {'v': obj}, cases=10,
+                     returns='none', static=True, out=out)
+        records = [json.loads(l) for l in (out / 'v.jsonl').read_text().splitlines()]
+        self.assertTrue(all(len(r['calls']) == 1 and r['calls'][0]['to'].startswith('malloc@') for r in records))
+
+    def test_fault_and_timeout_inside_helpers_end_the_case(self):
+        source = self.root / 'outcomes.cpp'
+        source.write_text('__attribute__((noinline)) void bad() { volatile int *p = (volatile int *)0x12345000; *p = 1; } '
+                          '__attribute__((noinline)) void slow() { for (;;) {} } '
+                          'void faulting() { bad(); } void hanging() { slow(); }')
+        obj = source.with_suffix('.o')
+        run(['g++', '-O1', '-fno-pic', '-c', str(source), '-o', str(obj)])
+        for symbol, outcome in (('_Z8faultingv', 'crash'), ('_Z7hangingv', 'timeout')):
+            report = oracle.check(oracle.Harvest(self.root, 'test'), symbol, {'v': obj}, cases=1,
+                                  returns='none', static=True)
+            self.assertEqual(report['outcomes']['v'], {outcome: 1})
+
+    def test_real_trap_inside_a_followed_image_body_is_a_fault(self):
+        report = oracle.check(oracle.Harvest(self.root, 'test'), '_Z8trappingv',
+                              {'object': self.objects['outline'], 'original': 'image'}, cases=1,
+                              returns='none', static=True)
+        self.assertEqual(report['comparison']['object vs original']['differ'], 0)
+        self.assertEqual(report['outcomes']['original'], {'signal': 1})
+
+    def test_recursive_same_unit_calls_execute(self):
+        report = oracle.check(oracle.Harvest(self.root, 'test'), '_Z9recursivePib',
+                              {'object': self.objects['outline'], 'original': 'image'}, cases=20,
+                              returns='int', static=True)
+        self.assertEqual(report['comparison']['object vs original']['differ'], 0)
+
+
 class Helpers(unittest.TestCase):
     def test_parameters_split_at_top_level(self):
         self.assertEqual(oracle.parameters("f(int, ox::core::CRect<float> const&, a<b, c>)"),

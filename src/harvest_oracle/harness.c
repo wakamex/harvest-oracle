@@ -343,13 +343,12 @@ static void emulate_call(ucontext_t *uc, uint64_t target) {
 // Indexed reads of a version's own sized data, from ORACLE_GUARDS: each guarded instruction starts with int3,
 // and a read outside the indexed symbol's extent ends the case as undefined, since what lies past a static
 // table depends on each build's data layout. An in-bounds read runs the original instruction by single step.
-#define MAX_GUARDS 256
 struct guard {
   uint64_t insn, disp, start, end;
   int base, index, scale, wide;  // ucontext register numbers, -1 for none; wide: 64-bit registers
   unsigned char original;
 };
-static struct guard guards[MAX_GUARDS];
+static struct guard *guards;
 static int guard_count, stepping = -1;
 
 static void set_byte(uint64_t address, unsigned char value) {
@@ -387,17 +386,129 @@ static int guard_trap(ucontext_t *uc) {
   return 0;
 }
 
+// Control transfers that require routing or form indirect boundaries. Direct followed calls run normally.
+struct branch {
+  uint64_t insn, next, target, disp, start, end;
+  int base, index, scale, memory, call;
+};
+static struct branch *branches;
+static size_t branch_count;
+struct code_range { uint64_t start, end; };
+static struct code_range *runnable;
+static size_t runnable_count;
+
+static int runnable_image(uint64_t address) {
+  for (size_t i = 0; i < runnable_count; i++)
+    if (address >= runnable[i].start && address < runnable[i].end)
+      return 1;
+  return own_end && address >= own_start && address < own_end;
+}
+
+void oracle_native(void);
+
+static int branch_trap(ucontext_t *uc) {
+  greg_t *g = uc->uc_mcontext.gregs;
+  for (size_t i = 0; i < branch_count; i++) {
+    struct branch *b = &branches[i];
+    if ((uint64_t)g[REG_RIP] - 1 != b->insn)
+      continue;
+    uint64_t target = b->target;
+    if (b->start) {
+      target = b->disp + (b->base >= 0 ? g[b->base] : 0) +
+               (b->index >= 0 ? g[b->index] * b->scale : 0);
+      if (b->memory) {
+        if (in_region(target))
+          map_region_page(target);
+        target = *(uint64_t *)target;
+      }
+    }
+    if (b->call) {
+      g[REG_RSP] -= 8;
+      *(uint64_t *)g[REG_RSP] = b->next;
+    }
+    // The decompiler adapter protocol is a harness entry, rather than a call made by the tested code.
+    if (target == (uint64_t)oracle_native) {
+      g[REG_RIP] = target;
+      return 1;
+    }
+    // An indirect jump inside its own function is a switch or computed goto. An indirect call, including
+    // one targeting a followed body, remains recorded. Direct entries routed to a variant execute there.
+    if (!b->start || (!b->call && target >= b->start && target < b->end)) {
+      g[REG_RIP] = target;
+      // A direct boundary has no runnable body. Its target is marked by end == 0 and start == 0; the
+      // plan uses memory == 2 only for redirects to runnable definitions.
+      if (!b->start && b->memory != 2)
+        emulate_call(uc, target);
+    } else {
+      emulate_call(uc, target);
+    }
+    return 1;
+  }
+  return 0;
+}
+
+static void load_plan(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    perror(path);
+    exit(1);
+  }
+  // Preserve the image bytes before masking any shared pages. Only the .text section is masked; adjacent
+  // read-only data and the procedure linkage table retain their bytes and permissions.
+  unsigned char *original = malloc(image_text_end - image_text_start);
+  memcpy(original, (void *)image_text_start, image_text_end - image_text_start);
+  mprotect((void *)image_text_start, image_text_end - image_text_start, PROT_READ | PROT_WRITE);
+  const char *text = getenv("ORACLE_TEXT");
+  unsigned long start, end;
+  if (!text || sscanf(text, "%lx:%lx", &start, &end) != 2)
+    exit(1);
+  memset((void *)start, 0xcc, end - start);
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    unsigned long size;
+    if (sscanf(line, "R %lx %lx", &start, &size) == 2) {
+      if (start < image_text_start || start + size > image_text_end)
+        exit(1);
+      memcpy((void *)start, original + start - image_text_start, size);
+      runnable = realloc(runnable, (runnable_count + 1) * sizeof(*runnable));
+      runnable[runnable_count++] = (struct code_range){start, start + size};
+    } else if (line[0] == 'N') {
+      char name[128];
+      if (sscanf(line, "N %lx %127s", &start, name) != 2 || plt_count == MAX_PLT)
+        exit(1);
+      plt_address[plt_count] = start;
+      plt_name[plt_count++] = strdup(name);
+    } else if (line[0] == 'B') {
+      struct branch b;
+      if (sscanf(line, "B %lx %lx %lx %d %d %d %lx %d %d %lx %lx", &b.insn, &b.next, &b.target,
+                 &b.base, &b.index, &b.scale, &b.disp, &b.memory, &b.call, &b.start, &b.end) != 11)
+        exit(1);
+      branches = realloc(branches, (branch_count + 1) * sizeof(*branches));
+      branches[branch_count++] = b;
+    }
+  }
+  fclose(f);
+  free(original);
+  mprotect((void *)image_text_start, image_text_end - image_text_start, PROT_READ);
+  // Each restored range gets execute permission, with masked neighbours still trapping.
+  for (size_t i = 0; i < runnable_count; i++) {
+    uint64_t page = runnable[i].start & ~(PAGE - 1), last = (runnable[i].end + PAGE - 1) & ~(PAGE - 1);
+    mprotect((void *)page, last - page, PROT_READ | PROT_EXEC);
+  }
+  for (size_t i = 0; i < branch_count; i++)
+    set_byte(branches[i].insn, 0xcc);
+}
+
 static void handler(int signal, siginfo_t *info, void *context) {
   ucontext_t *uc = context;
   greg_t *g = uc->uc_mcontext.gregs;
   uint64_t rip = g[REG_RIP], fault = (uint64_t)info->si_addr;
   if (signal == SIGALRM)
     finish("timeout", rip, NULL);
-  if (signal == SIGTRAP && guard_trap(uc))
+  if (signal == SIGTRAP && (guard_trap(uc) || branch_trap(uc)))
     return;
   // A call or jump out of the image function under test lands on the int3 filling the rest of its pages.
-  if (signal == SIGTRAP && own_end && rip - 1 >= text_start && rip - 1 < text_end &&
-      (rip - 1 < own_start || rip - 1 >= own_end)) {
+  if (signal == SIGTRAP && rip - 1 >= image_text_start && rip - 1 < image_text_end && !runnable_image(rip - 1)) {
     emulate_call(uc, rip - 1);
     return;
   }
@@ -616,9 +727,13 @@ int main(int argc, char **argv) {
     plt_address[plt_count] = strtoull(entry, NULL, 0);
     plt_name[plt_count++] = name;
   }
+  const char *plan = getenv("ORACLE_PLAN");
+  if (plan)
+    load_plan(plan);
   char *guard_list = getenv("ORACLE_GUARDS");
-  for (char *entry = guard_list ? strtok(guard_list, ",") : NULL; entry && guard_count < MAX_GUARDS;
+  for (char *entry = guard_list ? strtok(guard_list, ",") : NULL; entry;
        entry = strtok(NULL, ",")) {
+    guards = realloc(guards, (guard_count + 1) * sizeof(*guards));
     struct guard *q = &guards[guard_count];
     if (sscanf(entry, "%lx:%lx:%lx:%lx:%d:%d:%d:%d", &q->insn, &q->disp, &q->start, &q->end, &q->base, &q->index,
                &q->scale, &q->wide) != 8)

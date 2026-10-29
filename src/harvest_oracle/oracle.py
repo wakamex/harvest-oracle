@@ -1,13 +1,16 @@
 """Differential check of one Harvest function across versions of its machine code.
 
 A version is a relocatable object that defines the function: a build of Harvest's source, the target object
-delinked from the original executable, or an object compiled from a decompiler's C. Each is linked alone at
-0x20000000 with every other symbol bound to its address in the original executable (symbols.tsv); callees
+delinked from the original executable, or an object compiled from a decompiler's C. Each is linked at
+0x20000000 with data bound to the original executable (symbols.tsv). Direct callees visible to the compiler
+execute in the version or the image; other callees
 without a known address become named stubs. The harness runs every version on the same generated cases,
 and the cases are compared: outcome, return value, the ordered calls out of the function with their
 arguments, and every word written to generated memory or the executable's globals.
 """
 
+import bisect
+import functools
 import hashlib
 import json
 import os
@@ -20,6 +23,7 @@ from pathlib import Path
 BASE = 0x20000000
 # A version given as this path runs the original executable's own code of the function in place.
 IMAGE = "image"
+ALLOCATORS = frozenset(("_Znwm", "_Znam", "malloc", "calloc", "realloc"))
 # Undefined symbols without an address in symbols.tsv that are data, not functions.
 DATA_PREFIXES = ("_ZTV", "_ZTI", "_ZTS", "__dso_handle")
 # The harness fills the argument registers a call may clobber with this after every recorded call, and the
@@ -97,6 +101,130 @@ class Harvest:
                 if m:
                     kinds.add(kind_of(m.group(1).replace(" ", "")))
         return kinds.pop() if len(kinds) == 1 else "none"
+
+    @property
+    def vague_functions(self):
+        """Weak text definitions across this build, cached by object path, size and nanosecond mtime."""
+        objects = sorted((self.root / "build" / "match" / self.build).rglob("*.o"))
+        stamps = [(str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in objects]
+        key = hashlib.sha256(json.dumps(stamps).encode()).hexdigest()
+        cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle" / "weak-functions"
+        path = cache / f"{key}.json"
+        if path.exists():
+            return set(json.loads(path.read_text()))
+        names = set()
+        # One binutils invocation for the whole build. W denotes a weak function; V denotes weak data.
+        if objects:
+            for line in run(["nm", "--defined-only", *map(str, objects)]).splitlines():
+                parts = line.split()
+                if len(parts) == 3 and parts[1] == "W":
+                    names.add(parts[2])
+        cache.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(sorted(names)))
+        temporary.replace(path)
+        return names
+
+
+def functions(path):
+    """Sized text symbols, including local definitions and aliases."""
+    return {p[3]: (int(p[0], 16), int(p[1], 16))
+            for line in run(["nm", "-S", str(path)]).splitlines()
+            if len(p := line.split()) == 4 and p[2] in "tTwW" and int(p[1], 16)}
+
+
+@functools.lru_cache(maxsize=8)
+def instructions(path, size, mtime):
+    """Disassemble an immutable file once; stat values invalidate reused paths."""
+    result = []
+    for line in run(["objdump", "-d", "-w", str(path)]).splitlines():
+        m = re.match(r"\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*([\w.]+)\s*(.*)", line)
+        if m:
+            result.append((int(m[1], 16), len(m[2].split()), m[3], m[4].split("#")[0].strip()))
+    return result
+
+
+def listing(path):
+    stat = Path(path).stat()
+    return instructions(str(path), stat.st_size, stat.st_mtime_ns)
+
+
+def execution_plan(harvest, elf, entry, function, follow, out):
+    """Reachable direct-call closure over a fixed follow set; indirect calls remain boundaries.
+
+    A small file tells the harness which image ranges to restore and which transfer instructions to trap.
+    Transfers are trapped at their source so an indirect call stays recorded even when its target is runnable.
+    """
+    own = functions(elf) if elf != "-" else {}
+    original = {name: (address, harvest.sizes[name]) for name, address in harvest.known.items()
+                if name in follow and harvest.sizes.get(name)}
+    # Prefer the version's definition, including for calls made by an image fallback body.
+    redirects = {harvest.known[n]: a for n, (a, _) in own.items() if n in harvest.known}
+    extents = {a: n for a, n in original.values()}
+    extents.update({a: size for name, (a, size) in own.items() if name not in ALLOCATORS})
+    allocator_addresses = {a: name for name, (a, _) in own.items() if name in ALLOCATORS}
+    image_code = listing(harvest.image)
+    object_code = listing(elf) if elf != "-" else []
+    image_addresses = [r[0] for r in image_code]
+    object_addresses = [r[0] for r in object_code]
+    pending, visited = [entry], set()
+    rows = [f"N {address:x} {name}" for address, name in allocator_addresses.items()]
+    while pending:
+        start = pending.pop()
+        if start in visited or start not in extents:
+            continue
+        visited.add(start)
+        end = start + extents[start]
+        if elf == "-" or start < BASE:
+            rows.append(f"R {start:x} {end - start:x}")
+        code, addresses = (image_code, image_addresses) if start < BASE else (object_code, object_addresses)
+        for address, length, op, arg in code[bisect.bisect_left(addresses, start):bisect.bisect_left(addresses, end)]:
+            if not start <= address < end or op not in ("call", "callq", "jmp", "jmpq"):
+                continue
+            indirect = arg.startswith("*")
+            if not indirect:
+                m = re.match(r"([0-9a-f]+)", arg)
+                if not m:
+                    raise ValueError(f"{function}: unsupported transfer at {address:x}: {arg}")
+                target = int(m[1], 16)
+                if start <= target < end and not op.startswith("call"):
+                    continue
+                target = redirects.get(target, target) if elf != "-" else target
+                if target in extents:
+                    pending.append(target)
+                    # Original direct calls execute in place when they already have the right target.
+                    if target == int(m[1], 16):
+                        continue
+                elif target >= BASE and elf != "-" and target not in allocator_addresses:
+                    # Named stubs and decompiler adapters keep their existing mechanism.
+                    continue
+                rows.append(f"B {address:x} {address + length:x} {target:x} -1 -1 1 0 {2 if target in extents else 0} {int(op.startswith('call'))} 0 0")
+            else:
+                operand = arg[1:]
+                base = index = -1
+                scale, displacement, memory, target = 1, 0, 0, 0
+                if operand.startswith("%"):
+                    base = UCONTEXT_REGISTERS[operand[1:]]
+                else:
+                    memory = 1
+                    m = re.fullmatch(r"(-?(?:0x)?[0-9a-f]+)?\((?:%(\w+))?(?:,%(\w+)(?:,([1248]))?)?\)", operand)
+                    if m:
+                        displacement = int(m[1] or "0", 16)
+                        if m[2] == "rip":
+                            displacement += address + length
+                        elif m[2]:
+                            base = UCONTEXT_REGISTERS[m[2]]
+                        if m[3]:
+                            index = UCONTEXT_REGISTERS[m[3]]
+                        scale = int(m[4] or 1)
+                    elif re.fullmatch(r"(?:0x)?[0-9a-f]+", operand):
+                        displacement = int(operand, 16)
+                    else:
+                        raise ValueError(f"{function}: unsupported indirect transfer at {address:x}: {arg}")
+                rows.append(f"B {address:x} {address + length:x} {target:x} {base} {index} {scale} {displacement & ((1 << 64) - 1):x} {memory} {int(op.startswith('call'))} {start:x} {end:x}")
+    path = out / (Path(elf).stem + ".plan" if elf != "-" else "image.plan")
+    path.write_text("\n".join(rows) + "\n")
+    return path
 
 
 def kind_of(type_name):
@@ -194,12 +322,13 @@ def describe_callees(callees, signatures, pointee):
 
 
 def link(harvest, name, obj, function, out, pad=False):
-    """Link OBJ alone so that FUNCTION is its only code that runs.
+    """Link OBJ with its own text definitions available to direct calls.
 
     Returns the linked executable, the function's address in it, the address of the named stubs' thunk slot,
     the named stubs and the ranges of the version's own copies of executable data."""
     known = harvest.known
     defined, undefined, data = set(), set(), set()
+    text_definitions = set(functions(obj))
     for line in run(["nm", str(obj)]).splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] == "U":
@@ -226,6 +355,8 @@ def link(harvest, name, obj, function, out, pad=False):
             defsyms.append(f"--defsym={symbol}=0x{segments[int(segment.group(1))]:x}")
         elif re.fullmatch(r"function_0x[0-9a-f]+_Code_x86_64", symbol):
             defsyms.append(f"--defsym={symbol}=0x{symbol[11:-12]}")
+        elif symbol in text_definitions:
+            continue
         elif symbol in known:
             defsyms.append(f"--defsym={symbol}=0x{known[symbol]:x}")
         elif re.fullmatch(r"sub_[0-9a-f]+", symbol) and inside(int(symbol[4:], 16)):
@@ -263,7 +394,11 @@ def link(harvest, name, obj, function, out, pad=False):
         if len(parts) == 3:
             addresses[parts[2]] = int(parts[0], 16)
     native = addresses.get("oracle_native_slot")
-    return elf, addresses[function], (addresses["oracle_thunk_slot"], native), stubs, translations(linker_map, known)
+    ranges = translations(linker_map, known)
+    # Indirect calls to a local copy retain the original callee identity. Stored code pointers likewise
+    # compare by their executable address rather than the version's link address.
+    ranges += [(address, size, known[n]) for n, (address, size) in functions(elf).items() if n in known]
+    return elf, addresses[function], (addresses["oracle_thunk_slot"], native), stubs, ranges
 
 
 def translations(linker_map, known):
@@ -308,7 +443,7 @@ UCONTEXT_REGISTERS.update({"e" + n[1:] if n[0] == "r" and n[1:].isalpha() else n
                            for n, v in list(UCONTEXT_REGISTERS.items())})
 
 
-def guards(elf, function):
+def guards(elf, function=None):
     """Indexed reads of the version's own sized data in FUNCTION: instructions addressing disp(base,index,scale)
     whose displacement falls inside a sized data symbol, with that symbol's extent."""
     symbols = []
@@ -317,11 +452,13 @@ def guards(elf, function):
         if len(parts) == 4 and parts[2] in "rRdDbB":
             symbols.append((int(parts[0], 16), int(parts[0], 16) + int(parts[1], 16)))
     listing = run(["objdump", "-d", "--no-show-raw-insn", str(elf)])
-    body = listing.split(f"<{function}>:\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    body = (listing.split(f"<{function}>:\n", 1)[1].split("\n\n", 1)[0] if function else listing).splitlines()
     instructions = [(int(m.group(1), 16), m.group(2)) for m in
                     (re.match(r"\s*([0-9a-f]+):\s+(.*)", line) for line in body) if m]
     result = []
     for (address, text), (following, _) in zip(instructions, instructions[1:] + [(None, None)]):
+        if text.startswith(("call", "jmp")):
+            continue
         m = re.search(r"(-?0x[0-9a-f]+)\((?:%(\w+))?,%(\w+),([1248])\)", text)
         if not m:
             continue
@@ -345,24 +482,28 @@ def text_section(image):
     raise SystemExit(f"{image} has no .text section")
 
 
-def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_list=""):
+def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_list="", plan=None):
     """Run the harness on seeds 1 to CASES, or on SEEDS. ELF is a linked version, or "-" with
     OWN = (start, size) to run the executable's own code of the function in place."""
     if seeds is not None:
         return [r for seed in seeds
-                for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed, guard_list=guard_list)]
-    return execute_range(harvest, elf, entry, slot, spec, cases, own, guard_list=guard_list)
+                for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed, guard_list=guard_list, plan=plan)]
+    return execute_range(harvest, elf, entry, slot, spec, cases, own, guard_list=guard_list, plan=plan)
 
 
-def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list=""):
+def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list="", plan=None):
     thunk, native = slot if isinstance(slot, tuple) else (slot, None)
     env = {"ORACLE_THUNK_SLOT": f"0x{thunk:x}"} if thunk else {}
     if native:
         env["ORACLE_NATIVE_SLOT"] = f"0x{native:x}"
     env["ORACLE_PLT"] = harvest.plt
+    if plan:
+        env["ORACLE_PLAN"] = str(plan)
+        text = text_section(harvest.image)
+        env["ORACLE_TEXT"] = f"0x{text[0]:x}:0x{text[1]:x}"
     if guard_list:
         env["ORACLE_GUARDS"] = guard_list
-    if own:
+    if own and not plan:
         text = text_section(harvest.image)
         env.update(ORACLE_IMAGE_FUNCTION=f"0x{own[0]:x}:{own[1]}", ORACLE_TEXT=f"0x{text[0]:x}:0x{text[1]:x}")
     output = subprocess.run([str(harness_binary()), str(harvest.image), str(elf), f"0x{entry:x}", spec, str(first),
@@ -375,19 +516,19 @@ GP_NAMES = [("rdi", "edi", "di", "dil"), ("rsi", "esi", "si", "sil"), ("rdx", "e
 
 
 def integer_setups(path, start, end):
+    stat = Path(path).stat()
+    return _integer_setups(str(path), stat.st_size, stat.st_mtime_ns, start, end)
+
+
+@functools.lru_cache(maxsize=8)
+def _integer_setups(path, size, mtime, start, end):
     """For each call in [START, END) of PATH, by return address, the integer argument registers written by the
     straight-line instructions before it, back to the previous call, jump or branch target. Code also uses those
     registers as scratch between calls, so for a call without a known signature only a register both versions
     set up for that call is compared."""
-    listing = run(["objdump", "-d", "--no-show-raw-insn", f"--start-address=0x{start:x}", f"--stop-address=0x{end:x}",
-                   str(path)])
-    instructions, targets = [], set()
-    for line in listing.splitlines():
-        m = re.match(r"\s*([0-9a-f]+):\s+(\S+)\s*(.*)", line)
-        if not m:
-            continue
-        address, mnemonic, operands = int(m.group(1), 16), m.group(2), m.group(3).split("#")[0].strip()
-        instructions.append((address, mnemonic, operands))
+    instructions = [(a, op, args) for a, _, op, args in listing(path) if start <= a < end]
+    targets = set()
+    for _, mnemonic, operands in instructions:
         t = re.match(r"([0-9a-f]+)\b", operands) if mnemonic.startswith(("j", "call")) else None
         if t:
             targets.add(int(t.group(1), 16))
@@ -408,17 +549,17 @@ def integer_setups(path, start, end):
     return setups
 
 
-def cached_image_run(harvest, start, size, spec, cases):
+def cached_image_run(harvest, start, size, spec, cases, plan=None):
     """The executable's own code run in place: the same for every check of a function, so it is kept in the user
     cache, keyed by the executable, the function, its arguments, the case count and the harness build."""
     image = harvest.image.stat()
     key = hashlib.sha256(f"{harvest.image.resolve()}:{image.st_size}:{image.st_mtime_ns}:{start}:{size}:{spec}:"
-                         f"{cases}:{harness_binary().name}".encode()).hexdigest()[:24]
+                         f"{cases}:{harness_binary().name}:{plan.read_text() if plan else ''}".encode()).hexdigest()[:24]
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle" / "image-runs"
     path = cache / f"{key}.json"
     if path.exists():
         return json.loads(path.read_text())
-    result = execute(harvest, "-", start, None, spec, cases, own=(start, size))
+    result = execute(harvest, "-", start, None, spec, cases, own=(start, size), plan=plan)
     cache.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(result))
@@ -430,11 +571,12 @@ def inside_ranges(value, *range_lists):
     return any(start <= value < start + size for ranges in range_lists for start, size, _ in ranges)
 
 
-def call_identity(call, names):
+def call_identity(call, names, ranges=()):
     target = call["to"]
     if "@" in target:
         return target.split("@")[0]
-    return names.get(int(target, 16), target)
+    address = translate(int(target, 16), ranges)
+    return names.get(address, hex(address))
 
 
 def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, return_kind, setups_a=None,
@@ -454,7 +596,7 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
             if int(a[register], 16) & mask != int(b[register], 16) & mask:
                 diffs.append(f"return {a[register]} vs {b[register]}")
     for i, (x, y) in enumerate(zip(a["calls"], b["calls"])):
-        ix, iy = call_identity(x, names), call_identity(y, names)
+        ix, iy = call_identity(x, names, ranges_a), call_identity(y, names, ranges_b)
         if ix != iy:
             diffs.append(f"call {i}: {ix} vs {iy}")
             break
@@ -475,10 +617,17 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
         sizes = pointee.get(ix, [])
 
         def shown(call, ranges):
-            # The bytes behind a local are translated too: a local object's vtable pointer, say.
-            return [d and "local:" + normalized_writes([["0x0", d]], ranges)[0][1][: 2 * (sizes[k] if k < len(sizes) else 8)]
-                    or hex(translate(int(v, 16), ranges))
-                    for k, v, d in ((k, call["gp"][k], call["deref"][k]) for k in gp_indices)]
+            result = []
+            for k in gp_indices:
+                value, data = int(call["gp"][k], 16), call["deref"][k]
+                moved = translate(value, ranges)
+                # Code pointers keep address identity; data pointees still compare their contents.
+                canonical = any(image <= moved < image + size and names.get(image) in signatures
+                                for _, size, image in ranges_a + ranges_b)
+                result.append(hex(moved) if canonical or not data else
+                              "local:" + normalized_writes([["0x0", data]], ranges)[0][1][:
+                                  2 * (sizes[k] if k < len(sizes) else 8)])
+            return result
 
         # Identical raw arguments, none pointing into translated data, are equal without translating.
         if (all(x["gp"][k] == y["gp"][k] and x["deref"][k] == y["deref"][k] for k in gp_indices)
@@ -516,6 +665,11 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
     signatures, pointee = {}, {}
     describe_callees(list(harvest.known), signatures, pointee)
     describe_callees([entry.split("=", 1)[1] for entry in harvest.plt.split(",") if "=" in entry], signatures, pointee)
+    follow = harvest.vague_functions | {function}
+    for obj in versions.values():
+        if str(obj) != IMAGE:
+            follow.update(functions(obj))
+    follow -= ALLOCATORS
     with tempfile.TemporaryDirectory() as scratch:
         directory = Path(out) if out else Path(scratch)
         directory.mkdir(parents=True, exist_ok=True)
@@ -527,14 +681,14 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                     raise SystemExit(f"{function} has no address and size in {harvest.symbols}")
                 start, size = harvest.known[function], harvest.sizes[function]
                 stubs, ranges[name] = [], []
-                results[name] = cached_image_run(harvest, start, size, spec, cases)
-                setups[name] = integer_setups(harvest.image, start, start + size)
+                plan = execution_plan(harvest, "-", start, function, follow, directory)
+                results[name] = cached_image_run(harvest, start, size, spec, cases, plan)
+                setups[name] = integer_setups(harvest.image, 0, BASE)
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
-                results[name] = execute(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf, function))
-                size = next((int(line.split()[1], 16) for line in run(["nm", "-S", str(elf)]).splitlines()
-                             if line.split()[-1] == function and len(line.split()) == 4), None)
-                setups[name] = integer_setups(elf, entry, entry + size) if size else {}
+                plan = execution_plan(harvest, elf, entry, function, follow, directory)
+                results[name] = execute(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf), plan=plan)
+                setups[name] = {**integer_setups(harvest.image, 0, BASE), **integer_setups(elf, BASE, 1 << 64)}
                 # The same version with its own data 4 KB further on, for the layout check.
                 padded = directory / "padded"
                 padded.mkdir(exist_ok=True)
@@ -562,8 +716,9 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         suspects = sorted({i for indices in differing.values() for i in indices})
         for name, (padded, obj) in runners.items() if suspects else ():
             elf, entry, slot, _, padded_ranges = link(harvest, name, obj, function, padded, pad=True)
-            moved = execute(harvest, elf, entry, slot, spec, None, seeds=[i + 1 for i in suspects],
-                            guard_list=guards(elf, function))
+            plan = execution_plan(harvest, elf, entry, function, follow, padded)
+            moved = execute(harvest, elf, entry, slot, spec, None, plan=plan, seeds=[i + 1 for i in suspects],
+                            guard_list=guards(elf))
             for i, again in zip(suspects, moved):
                 if differs(results[name][i], again, ranges[name], padded_ranges):
                     layout_dependent.add(i)
@@ -581,7 +736,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         for r in rs:
             outcomes[n][r["outcome"]] = outcomes[n].get(r["outcome"], 0) + 1
     # Distinct behaviors per version, by outcome, fault address and the sequence of callees.
-    coverage = {n: len({(r["outcome"], r["detail"], tuple(call_identity(c, harvest.names) for c in r["calls"]))
+    coverage = {n: len({(r["outcome"], r["detail"], tuple(call_identity(c, harvest.names, ranges[n]) for c in r["calls"]))
                         for r in rs}) for n, rs in results.items()}
     return {"function": function, "signature": signature, "argument_spec": spec, "returns": return_kind,
             "cases": cases, "outcomes": outcomes, "distinct_behaviors": coverage, "named_stubs": stub_lists,
