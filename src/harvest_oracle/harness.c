@@ -387,6 +387,46 @@ static int guard_trap(ucontext_t *uc) {
   return 0;
 }
 
+// A three-instruction addss/subss, ucomiss, ja loop changes only its scalar destination and floating-point
+// status. A repeated destination and status at a taken back edge prove that it will never exit. Probe at
+// most two iterations, then remove the breakpoint if it progresses, so long finite loops still run natively.
+struct loop {
+  uint64_t insn, target;
+  int reg, seen, disabled;
+  uint32_t previous, status;
+  unsigned char original;
+};
+static struct loop *loops;
+static size_t loop_count;
+
+static int loop_trap(ucontext_t *uc) {
+  greg_t *g = uc->uc_mcontext.gregs;
+  for (size_t i = 0; i < loop_count; i++) {
+    struct loop *q = &loops[i];
+    if (q->disabled || (uint64_t)g[REG_RIP] - 1 != q->insn)
+      continue;
+    uint32_t value;
+    memcpy(&value, &uc->uc_mcontext.fpregs->_xmm[q->reg], sizeof(value));
+    uint32_t status = uc->uc_mcontext.fpregs->mxcsr;
+    if (!(g[REG_EFL] & 0x41)) { // ja is taken exactly when carry and zero are both clear
+      if (q->seen && q->previous == value && q->status == status)
+        finish("timeout", q->insn, NULL);
+      if (!q->seen) {
+        q->seen = 1;
+        q->previous = value;
+        q->status = status;
+        g[REG_RIP] = q->target;
+        return 1;
+      }
+    }
+    q->disabled = 1;
+    set_byte(q->insn, q->original);
+    g[REG_RIP] = q->insn;
+    return 1;
+  }
+  return 0;
+}
+
 // Control transfers that require routing or form indirect boundaries. Direct followed calls run normally.
 struct branch {
   uint64_t insn, next, target, disp, start, end;
@@ -473,6 +513,12 @@ static void load_plan(const char *path) {
       memcpy((void *)start, original + start - image_text_start, size);
       runnable = realloc(runnable, (runnable_count + 1) * sizeof(*runnable));
       runnable[runnable_count++] = (struct code_range){start, start + size};
+    } else if (line[0] == 'L') {
+      struct loop q = {0};
+      if (sscanf(line, "L %lx %lx %d", &q.insn, &q.target, &q.reg) != 3 || q.reg < 0 || q.reg > 15)
+        exit(1);
+      loops = realloc(loops, (loop_count + 1) * sizeof(*loops));
+      loops[loop_count++] = q;
     } else if (line[0] == 'N') {
       char name[128];
       if (sscanf(line, "N %lx %127s", &start, name) != 2 || plt_count == MAX_PLT)
@@ -498,6 +544,10 @@ static void load_plan(const char *path) {
   }
   for (size_t i = 0; i < branch_count; i++)
     set_byte(branches[i].insn, 0xcc);
+  for (size_t i = 0; i < loop_count; i++) {
+    loops[i].original = *(unsigned char *)loops[i].insn;
+    set_byte(loops[i].insn, 0xcc);
+  }
 }
 
 static void handler(int signal, siginfo_t *info, void *context) {
@@ -506,7 +556,7 @@ static void handler(int signal, siginfo_t *info, void *context) {
   uint64_t rip = g[REG_RIP], fault = (uint64_t)info->si_addr;
   if (signal == SIGALRM)
     finish("timeout", rip, NULL);
-  if (signal == SIGTRAP && (guard_trap(uc) || branch_trap(uc)))
+  if (signal == SIGTRAP && (guard_trap(uc) || loop_trap(uc) || branch_trap(uc)))
     return;
   // A call or jump out of the image function under test lands on the int3 filling the rest of its pages.
   if (signal == SIGTRAP && rip - 1 >= image_text_start && rip - 1 < image_text_end && !runnable_image(rip - 1)) {

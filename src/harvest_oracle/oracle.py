@@ -235,7 +235,16 @@ def execution_plan(harvest, elf, entry, function, follow, out):
         if elf == "-" or start < BASE:
             rows.append(f"R {start:x} {end - start:x}")
         code, addresses = (image_code, image_addresses) if start < BASE else (object_code, object_addresses)
-        for address, length, op, arg in code[bisect.bisect_left(addresses, start):bisect.bisect_left(addresses, end)]:
+        body = code[bisect.bisect_left(addresses, start):bisect.bisect_left(addresses, end)]
+        for update, compare, branch in zip(body, body[1:], body[2:]):
+            # This entire loop changes only one scalar register and floating-point status. Repeating its
+            # destination at a taken back edge proves nontermination, with no intervening calls or writes.
+            register = re.fullmatch(r"%xmm\d+,\s*%xmm(\d+)", update[3])
+            if (update[2] in ("addss", "subss") and register and compare[2] == "ucomiss"
+                    and branch[2] == "ja" and re.match(rf"{update[0]:x}\b", branch[3])
+                    and update[0] + update[1] == compare[0] and compare[0] + compare[1] == branch[0]):
+                rows.append(f"L {branch[0]:x} {update[0]:x} {register[1]}")
+        for address, length, op, arg in body:
             if not start <= address < end or op not in ("call", "callq", "jmp", "jmpq"):
                 continue
             indirect = arg.startswith("*")
@@ -809,18 +818,30 @@ def _integer_setups(path, size, mtime, start, end):
 
 
 def cached_image_run(harvest, start, size, spec, cases, plan=None):
-    """The executable's own code run in place: the same for every check of a function, so it is kept in the user
-    cache, keyed by the executable, the function, its arguments, the case count and the harness build."""
-    image = harvest.image.stat()
-    key = hashlib.sha256(f"{harvest.image.resolve()}:{image.st_size}:{image.st_mtime_ns}:{start}:{size}:{spec}:"
-                         f"{cases}:{harness_binary().name}:{plan.read_text() if plan else ''}".encode()).hexdigest()[:24]
-    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle" / "image-runs"
+    """Keep image execution on the same cache contract as linked object execution."""
+    return cached_run(harvest, "-", start, None, spec, cases, own=(start, size), plan=plan)
+
+
+def cached_run(harvest, elf, entry, slot, spec, cases, own=None, guard_list="", plan=None):
+    """Reuse records only for identical machine code and complete harness inputs, independent of filenames.
+
+    Explicit seed reruns for the layout check still execute directly. Like image records, cached object
+    records retain the measured timeout prefix; comparison uses only calls both executions completed.
+    """
+    def digest(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    inputs = [digest(harvest.image), digest(elf) if str(elf) != "-" else None, digest(harness_binary()),
+              entry, slot, spec, cases, own, guard_list, plan.read_text() if plan else None,
+              harvest.plt, text_section(harvest.image) if plan or own else None]
+    key = hashlib.sha256(json.dumps(inputs).encode()).hexdigest()
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle" / "runs"
     path = cache / f"{key}.json"
     if path.exists():
         return json.loads(path.read_text())
-    result = execute(harvest, "-", start, None, spec, cases, own=(start, size), plan=plan)
+    result = execute(harvest, elf, entry, slot, spec, cases, own=own, guard_list=guard_list, plan=plan)
     cache.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(result))
     temporary.replace(path)
     return result
@@ -931,7 +952,10 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
         if count and x["xmm"][: count[1]] != y["xmm"][: count[1]]:
             diffs.append(f"call {i} {ix} float args {x['xmm'][:count[1]]} vs {y['xmm'][:count[1]]}")
             break
-    if len(a["calls"]) != len(b["calls"]) and not diffs:
+    # Both executions reached every completed call in their shared prefix. The longer tail of two
+    # alarm-limited traces reflects elapsed time, so it cannot establish a behavioral difference.
+    if (len(a["calls"]) != len(b["calls"]) and not diffs
+            and not a["outcome"] == b["outcome"] == "timeout"):
         diffs.append(f"{len(a['calls'])} calls vs {len(b['calls'])}")
     # A case that stops on a fault compares its calls and fault address but not its writes, since which
     # stores precede a faulting load depends on instruction scheduling.
@@ -978,7 +1002,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
                 plan = execution_plan(harvest, elf, entry, function, follow, directory)
-                results[name] = execute(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf), plan=plan)
+                results[name] = cached_run(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf), plan=plan)
                 setups[name] = {**integer_setups(harvest.image, 0, BASE), **integer_setups(elf, BASE, 1 << 64)}
                 # The same version with its own data 4 KB further on, for the layout check.
                 padded = directory / "padded"

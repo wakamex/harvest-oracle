@@ -23,6 +23,8 @@ For each case:
 
 Followed calls themselves add no trace event and consume no generated return value. Their boundary calls and writes are compared as though their bodies had been inlined. Stack writes remain uncompared. Known code pointers in an object are translated to their executable addresses, including indirect-call targets. Known string parameters of the [Lua 5.1 C API](https://www.lua.org/manual/5.1/manual.html) and the [GNU C Library (glibc)](https://www.gnu.org/software/libc/) string functions use their parameter rules: counted strings compare their declared length, and zero-terminated strings compare through the terminator.
 
+When both versions time out, only their completed common call prefix is compared. A different target or argument within that prefix remains a difference; the longer trace's unmatched tail and either version's writes cannot establish a difference because the alarm stops execution according to elapsed time. A timeout against another outcome remains a difference.
+
 Calls without a known signature, such as virtual calls, compare `rdi`, `rsi` and `xmm0` to `xmm3`, skipping any register that still holds the poison in either version. An argument that points into the stack, into the version's own data or into the executable's read-only data is compared by the bytes it points at, up to the size of its parameter type. A known code pointer compares by its executable address. A pointer into a version's own copy of executable data (a section named after a symbol of the executable, such as `.rodata._ZTV...`) is translated to the executable's address before comparing. Writes are not compared for cases that fault, since which stores precede a faulting load depends on instruction scheduling.
 
 An indexed read in the object, including a followed helper, is guarded when its displacement or a short register and stack address sequence identifies a version's own sized read-only data symbol, such as a static table. The harness computes the read address, and an address outside that symbol's extent ends the case as undefined. Such a case is left out of the comparison, since what lies past a static table depends on each build's data layout. In-bounds reads run unchanged. Writes, non-indexed loads from a fixed symbol address, and accesses without a read-only symbol base are not guarded.
@@ -30,6 +32,14 @@ An indexed read in the object, including a followed helper, is guarded when its 
 A case that differs is run again with each linked version's own data placed 4 KB further on. If a version then disagrees with itself, the case depends on that version's data layout, for example an out-of-range index into a static table or a value derived from an address, and it is reported as layout-dependent instead of as a difference.
 
 Delinked target objects can also be checked as objects. They need two more bindings, both by the label's name: `lbl_<address>` is bound to that address in the executable, and `sub_<address>` inside the function under test to the same offset in the linked copy. Prefer `image` for the original code: a delinked object can resolve a reference to the wrong data, such as a wide string literal to a narrow one in a merged string section, which the linker then shortens.
+
+## Execution cost
+
+The execution plan recognizes one narrowly defined loop: a register-to-register scalar floating-point addition or subtraction (`addss` or `subss`), an unordered comparison (`ucomiss`), and an unsigned-above jump (`ja`) back to the arithmetic instruction. These are instructions from [Streaming SIMD Extensions (SSE)](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html). The loop can change only its destination register and floating-point status. Two taken back edges with identical destination bits and status prove that it will repeat forever, so the harness reports the timeout immediately with the preceding calls and writes. This avoids waiting two seconds when an angle-normalization loop adds to or subtracts from infinity, or a number too large for the increment to change it. Other loops retain the shared two-second alarm. A progressing loop has its breakpoint removed after the second probe and runs normally for the rest of that case.
+
+Image and object run records are cached under `harvest-oracle/runs` in `XDG_CACHE_HOME`, or `~/.cache` by default. Keys include content hashes of the image, linked executable and harness, plus the entry, adapter slots, argument specification, case count, executable ranges, transfer plan, import bindings and data guards. Identical linked code can reuse a run across different object filenames. Explicit seed reruns for the data-layout check execute afresh. Cached timeouts retain the captured prefix and use the same timeout comparison rule.
+
+On the validation host, `CDropshipEntity::updateLogic` at 5,000 cases falls from approximately 186 seconds to 6.4 seconds for identical objects and 10.3 seconds for its NaN-only mutation pair, with the same outcomes, returns, calls and writes. The baseline spends 176 seconds per pair waiting for 44 alarms in each version. The mutation still differs on 11 seeds. Cold runs include linking, harness compilation, execution and comparison.
 
 ## Installation
 
@@ -95,7 +105,7 @@ The indexed-data guard follows a base through RIP-relative `lea`, register copie
 uv run --locked python -m unittest discover -s tests -v
 ```
 
-The tests build fixed-address executables and compare equivalent compiles, inline and out-of-line helpers, same-unit and executable fallback bodies, indirect boundaries, recursion, and a comparison that differs only on NaN. A changed write inside a followed helper must still be caught.
+The tests build fixed-address executables and compare equivalent compiles, inline and out-of-line helpers, same-unit and executable fallback bodies, indirect boundaries, recursion, and a comparison that differs only on NaN. A changed write inside a followed helper must still be caught. Regression checks also cover unequal timeout prefixes, differences within completed prefixes, cache invalidation by content, proven stalled loops, and long finite loops.
 
 ## License
 

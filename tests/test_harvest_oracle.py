@@ -7,8 +7,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from harvest_oracle import accesses, oracle
 from harvest_oracle.cli import main
@@ -104,6 +106,33 @@ class SyntheticCheckout(unittest.TestCase):
         report = oracle.check(oracle.Harvest(self.root, "test"), UPDATE, {"a": self.objects["o2"], "b": "image"},
                               cases=200, returns="int", static=True)
         self.assertEqual(report["comparison"]["a vs b"]["differ"], 0)
+
+    def test_run_cache_uses_execution_inputs_and_file_contents(self):
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_CACHE_HOME": directory}):
+            out = Path(directory)
+            elf, entry, slot, _, _ = oracle.link(h, "cached", self.objects["o2"], UPDATE, out)
+            plan = oracle.execution_plan(h, elf, entry, UPDATE, {UPDATE}, out)
+            with patch.object(oracle, "execute_range", wraps=oracle.execute_range) as execute:
+                a = oracle.cached_run(h, elf, entry, slot, "pf", 10, plan=plan)
+                copy = out / "copy.elf"
+                copy.write_bytes(elf.read_bytes())
+                self.assertEqual(a, oracle.cached_run(h, copy, entry, slot, "pf", 10, plan=plan))
+                self.assertEqual(execute.call_count, 1)
+                plan.write_text(plan.read_text() + "\n")
+                self.assertEqual(a, oracle.cached_run(h, copy, entry, slot, "pf", 10, plan=plan))
+                self.assertEqual(execute.call_count, 2)
+                # Changing an unloaded symbol-table byte keeps execution valid. Preserve size and mtime
+                # so metadata alone cannot satisfy this invalidation check.
+                stamp = copy.stat()
+                data = bytearray(copy.read_bytes())
+                data[-1] ^= 1
+                copy.write_bytes(data)
+                os.utime(copy, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                self.assertEqual(a, oracle.cached_run(h, copy, entry, slot, "pf", 10, plan=plan))
+                self.assertEqual(execute.call_count, 3)
+                self.assertEqual(len(oracle.cached_run(h, copy, entry, slot, "pf", 11, plan=plan)), 11)
+                self.assertEqual(execute.call_count, 4)
 
     def test_reads_past_a_static_table_are_undefined(self):
         path = self.root / "table.cpp"
@@ -304,6 +333,125 @@ extern "C" void _start() { for (;;) {} }
 
 
 class Helpers(unittest.TestCase):
+    def test_fixed_point_float_loop_times_out_without_waiting_for_alarm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "orig" / "test").mkdir(parents=True)
+            (root / "config" / "test").mkdir(parents=True)
+            source = root / "loops.s"
+            source.write_text("""
+.text
+.globl stalled
+.type stalled,@function
+stalled:
+  mov $0x7f800000, %eax
+  movd %eax, %xmm0
+  mov $0x3f800000, %eax
+  movd %eax, %xmm1
+  xorps %xmm2, %xmm2
+1:
+  subss %xmm1, %xmm0
+  ucomiss %xmm2, %xmm0
+  ja 1b
+  ret
+.size stalled,.-stalled
+.globl stalled_add
+.type stalled_add,@function
+stalled_add:
+  mov $0x7f7fffff, %eax
+  movd %eax, %xmm0
+  mov $0xbf800000, %eax
+  movd %eax, %xmm1
+  xorps %xmm2, %xmm2
+3:
+  addss %xmm1, %xmm0
+  ucomiss %xmm2, %xmm0
+  ja 3b
+  ret
+.size stalled_add,.-stalled_add
+.globl writes_in_loop
+.type writes_in_loop,@function
+writes_in_loop:
+  mov $0x7f800000, %eax
+  movd %eax, %xmm0
+  mov $0x3f800000, %eax
+  movd %eax, %xmm1
+  xorps %xmm2, %xmm2
+  mov $3, %ecx
+4:
+  subss %xmm1, %xmm0
+  mov %ecx, loop_counter(%rip)
+  dec %ecx
+  je 5f
+  ucomiss %xmm2, %xmm0
+  ja 4b
+5:
+  ret
+.size writes_in_loop,.-writes_in_loop
+.globl finite
+.type finite,@function
+finite:
+  mov $0x49742400, %eax
+  movd %eax, %xmm0
+  mov $0x3f800000, %eax
+  movd %eax, %xmm1
+  xorps %xmm2, %xmm2
+2:
+  subss %xmm1, %xmm0
+  ucomiss %xmm2, %xmm0
+  ja 2b
+  ret
+.size finite,.-finite
+.globl _start
+_start: ret
+.data
+.globl loop_counter
+loop_counter: .long 0
+""")
+            obj = root / "loops.o"
+            image = root / "orig" / "test" / "Harvest"
+            run(["gcc", "-c", str(source), "-o", str(obj)])
+            run(["ld", "-static", "-Ttext=0x400000", str(obj), "-o", str(image)])
+            symbols = ["address\tsize\tsymbol"]
+            for line in run(["nm", "-S", str(image)]).splitlines():
+                parts = line.split()
+                if len(parts) == 4:
+                    symbols.append(f"0x{parts[0]}\t{int(parts[1], 16)}\t{parts[3]}")
+                elif len(parts) == 3 and parts[2] == "loop_counter":
+                    symbols.append(f"0x{parts[0]}\t4\t{parts[2]}")
+            (root / "config" / "test" / "symbols.tsv").write_text("\n".join(symbols) + "\n")
+            h = oracle.Harvest(root, "test")
+            for symbol in ("stalled", "stalled_add", "finite", "writes_in_loop"):
+                started = time.monotonic()
+                report = oracle.check(h, symbol, {"object": obj, "image": "image"}, cases=2,
+                                      returns="float", static=True, arguments="", out=root / symbol)
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertEqual(report["comparison"]["object vs image"]["differ"], 0)
+                self.assertEqual(report["outcomes"]["object"], {"timeout" if symbol.startswith("stalled") else "return": 2})
+                if symbol == "finite":
+                    records = [json.loads(line) for line in (root / symbol / "object.jsonl").read_text().splitlines()]
+                    self.assertTrue(all(int(r["xmm0"], 16) & 0xffffffff == 0 for r in records))
+
+                if symbol == "writes_in_loop":
+                    records = [json.loads(line) for line in (root / symbol / "object.jsonl").read_text().splitlines()]
+                    self.assertTrue(all(r["writes"] for r in records))
+                    self.assertFalse(any(line.startswith("L ") for line in
+                                         (root / symbol / "object.plan").read_text().splitlines()))
+
+    def test_timeout_compares_only_completed_common_calls(self):
+        call = {"to": "0x400000", "gp": ["0x1"] * 6, "xmm": [oracle.POISON] * 8,
+                "deref": [""] * 6}
+        a = {"outcome": "timeout", "detail": "0x401000", "calls": [call], "writes": []}
+        b = {**a, "detail": "0x402000", "calls": [call, call], "writes": [["0x1000", "01"]]}
+        self.assertEqual(oracle.case_differences(a, b, [], [], {}, {}, {}, "none"), [])
+        for left, right in ((133, 122), (63, 44), (0, 3)):
+            self.assertEqual(oracle.case_differences({**a, "calls": [call] * left},
+                                                   {**b, "calls": [call] * right},
+                                                   [], [], {}, {}, {}, "none"), [])
+        changed = {**call, "to": "0x500000"}
+        self.assertTrue(oracle.case_differences(a, {**b, "calls": [changed, call]}, [], [], {}, {}, {}, "none"))
+        self.assertTrue(oracle.case_differences(a, {**b, "outcome": "crash"}, [], [], {}, {}, {}, "none"))
+
     def test_indexed_table_guard_tracks_a_computed_base_and_skips_stores(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
