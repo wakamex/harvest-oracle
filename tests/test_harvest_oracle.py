@@ -134,6 +134,182 @@ class SyntheticCheckout(unittest.TestCase):
                 self.assertEqual(len(oracle.cached_run(h, copy, entry, slot, "pf", 11, plan=plan)), 11)
                 self.assertEqual(execute.call_count, 4)
 
+    def test_call_storage_uses_file_mappings_instead_of_whole_run_copies(self):
+        import mmap
+
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_CACHE_HOME": directory}):
+            out = Path(directory)
+            elf, entry, slot, _, _ = oracle.link(h, "mapped", self.objects["o2"], UPDATE, out)
+            plan = oracle.execution_plan(h, elf, entry, UPDATE, {UPDATE}, out)
+            subprocess_run = subprocess.run
+            spools = []
+
+            def observe_output(*args, **kwargs):
+                stream = kwargs.get("stdout")
+                if hasattr(stream, "fileno"):
+                    stat = os.fstat(stream.fileno())
+                    spools.append((stat.st_dev, stat.st_ino))
+                return subprocess_run(*args, **kwargs)
+
+            with patch.object(oracle.subprocess, "run", side_effect=observe_output):
+                a = oracle.cached_run(h, elf, entry, slot, "pf", 10, plan=plan)
+            b = oracle.cached_run(h, elf, entry, slot, "pf", 10, plan=plan)
+            self.assertIsInstance(a.data, mmap.mmap)
+            self.assertIsInstance(b.data, mmap.mmap)
+            self.assertEqual(a, b)
+            [cached] = (out / "harvest-oracle" / "runs").glob("*.bin")
+            stat = cached.stat()
+            self.assertEqual(spools, [(stat.st_dev, stat.st_ino)])
+
+    def test_binary_records_retain_legacy_fields_limits_and_write_budget(self):
+        source = self.root / "trace.cpp"
+        source.write_text('''extern void boundary(const char *, const char *, const char *, const char *, const char *, const char *);
+void trace(unsigned char *p) {
+  char text[64] = "captured text";
+  for (int i = 0; i < 1048576; i++) p[i] = (i * 27) | 1;
+  for (int i = 0; i < 4097; i++) boundary(text, text, text, text, text, text);
+}
+''')
+        obj = self.root / "trace.o"
+        run(["g++", "-O2", "-fno-pic", "-c", str(source), "-o", str(obj)])
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            symbol = "_Z5tracePh"
+            elf, entry, slot, _, _ = oracle.link(h, "trace", obj, symbol, out)
+            plan = oracle.execution_plan(h, elf, entry, symbol, {symbol}, out)
+            packed = oracle.execute_range(h, elf, entry, slot, "p", 1, plan=plan)
+            legacy = oracle.execute_range(h, elf, entry, slot, "p", 1, plan=plan, binary=False)
+            self.assertEqual(json.loads(json.dumps(packed, default=oracle.record_json)), legacy)
+            self.assertEqual(len(packed[0]["calls"]), 4096)
+            self.assertEqual(packed[0]["outcome"], "too-many-calls")
+            self.assertEqual(packed[0]["calls"][0]["deref"], [legacy[0]["calls"][0]["deref"][0]] * 6)
+            self.assertEqual(len(packed[0]["calls"][0]["deref"][0]), 64)
+            captured = sum(len(data) // 2 for _, data in packed[0]["writes"])
+            self.assertGreater(captured, 0)
+            self.assertLess(captured, 1048576)
+
+    def test_verdict_comparison_stops_after_an_outcome_difference(self):
+        class Unreadable:
+            def __iter__(self):
+                raise AssertionError("read calls after outcome already differed")
+
+        a = {"outcome": "return", "rax": "0x0", "writes": [], "calls": Unreadable()}
+        b = {"outcome": "crash", "detail": "0x0", "writes": [], "calls": Unreadable()}
+        self.assertEqual(oracle.case_differences(a, b, [], [], {}, {}, {}, "none", first_only=True),
+                         ["outcome return vs crash"])
+
+    def test_binary_record_decoder_rejects_truncated_frames(self):
+        with self.assertRaises(ValueError):
+            oracle.decode_records(b"ORCALL01")
+
+    def test_completed_record_emission_is_outside_the_execution_alarm(self):
+        source = self.root / "output.cpp"
+        source.write_text("extern int callee(int); void output_trace() { for (int i=0; i<4097; i++) callee(i); }\n")
+        obj = self.root / "output.o"
+        run(["g++", "-O2", "-fno-pic", "-c", str(source), "-o", str(obj)])
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            symbol = "_Z12output_tracev"
+            elf, entry, slot, _, _ = oracle.link(h, "output", obj, symbol, out)
+            plan = oracle.execution_plan(h, elf, entry, symbol, {symbol}, out)
+            start, end = oracle.text_section(h.image)
+            env = {"ORACLE_BINARY": "1", "ORACLE_PLAN": str(plan), "ORACLE_TEXT": f"0x{start:x}:0x{end:x}",
+                   "ORACLE_THUNK_SLOT": hex(slot[0]), "ORACLE_PLT": h.plt}
+            with subprocess.Popen([str(oracle.harness_binary()), str(h.image), str(elf), hex(entry), "", "1", "1"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, bufsize=0) as process:
+                header = process.stdout.read(32)
+                self.assertEqual(len(header), 32)
+                # Backpressure leaves the child in emission beyond its two-second execution budget.
+                time.sleep(2.1)
+                output, error = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, error)
+            [record] = oracle.decode_records(header + output)
+            self.assertEqual(record["outcome"], "too-many-calls")
+            self.assertEqual(len(record["calls"]), 4096)
+
+    def test_record_output_errors_fail_the_run(self):
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            elf, entry, slot, _, _ = oracle.link(h, "full", self.objects["o2"], UPDATE, out)
+            plan = oracle.execution_plan(h, elf, entry, UPDATE, {UPDATE}, out)
+            start, end = oracle.text_section(h.image)
+            env = {"ORACLE_BINARY": "1", "ORACLE_PLAN": str(plan), "ORACLE_TEXT": f"0x{start:x}:0x{end:x}",
+                   "ORACLE_THUNK_SLOT": hex(slot[0]), "ORACLE_PLT": h.plt}
+            with open("/dev/full", "wb") as full:
+                result = subprocess.run([str(oracle.harness_binary()), str(h.image), str(elf), hex(entry), "pf", "1", "1"],
+                                        stdout=full, stderr=subprocess.PIPE, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"record output", result.stderr)
+
+    def test_direct_boundary_thunks_retain_trap_records_and_register_state(self):
+        source = self.root / "boundary.s"
+        source.write_text('''
+.text
+.globl boundary_registers
+.type boundary_registers,@function
+boundary_registers:
+  push %rbx
+  mov %rdi, %rbx
+  mov $0x1234, %r10
+  mov $0x5678, %r11
+  pcmpeqd %xmm0, %xmm0
+  pcmpeqd %xmm3, %xmm3
+  xor %ecx, %ecx
+  cmp %ecx, %ecx
+  call _Z6calleei
+  mov %r10, (%rbx)
+  mov %r11, 8(%rbx)
+  movups %xmm0, 16(%rbx)
+  movups %xmm3, 32(%rbx)
+  pushfq
+  pop %rax
+  mov %rax, 48(%rbx)
+  stmxcsr 56(%rbx)
+  call boundary_tail
+  pop %rbx
+  ret
+.size boundary_registers,.-boundary_registers
+.globl boundary_tail
+.type boundary_tail,@function
+boundary_tail:
+  jmp _Z6calleei
+.size boundary_tail,.-boundary_tail
+''')
+        obj = self.root / "boundary.o"
+        run(["as", str(source), "-o", str(obj)])
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            elf, entry, slot, _, _ = oracle.link(h, "boundary", obj, "boundary_registers", out)
+            plan = oracle.execution_plan(h, elf, entry, "boundary_registers", set(oracle.functions(obj)), out)
+            self.assertEqual(sum(line.startswith("D ") for line in plan.read_text().splitlines()), 2)
+            native = oracle.execute_range(h, elf, entry, slot, "p", 4, plan=plan)
+            plan.write_text("\n".join("B" + line[1:] if line.startswith("D ") else line
+                                      for line in plan.read_text().splitlines()) + "\n")
+            trapped = oracle.execute_range(h, elf, entry, slot, "p", 4, plan=plan)
+            self.assertEqual(native, trapped)
+            self.assertEqual({r["outcome"] for r in native}, {"return"})
+            self.assertEqual({len(r["calls"]) for r in native}, {2})
+
+    def test_known_packed_calls_compare_without_materializing_unused_registers(self):
+        from harvest_oracle.records import CALL, PackedCalls
+
+        def trace(site, unused, argument=123):
+            row = [0, 1, argument, unused, 0, 0, 0, 0, *([0] * 8), 0, site, bytes(192)]
+            return {"outcome": "too-many-calls", "detail": "0x0", "writes": [],
+                    "calls": PackedCalls(CALL.pack(*row) * 4096, ["callee"])}
+
+        a, b = trace(100, 7), trace(200, 9)
+        expected = oracle.case_differences({**a, "calls": list(a["calls"])},
+                                           {**b, "calls": list(b["calls"])}, [], [], {}, {"callee": (1, 0)}, {}, "none")
+        with patch.object(PackedCalls, "__getitem__", side_effect=AssertionError("materialized a call")):
+            self.assertEqual(oracle.case_differences(a, b, [], [], {}, {"callee": (1, 0)}, {}, "none"), expected)
+        self.assertTrue(oracle.case_differences(a, trace(100, 7, 124), [], [], {}, {"callee": (1, 0)}, {}, "none"))
+
     def test_reads_past_a_static_table_are_undefined(self):
         path = self.root / "table.cpp"
         path.write_text(TABLE)
@@ -437,6 +613,27 @@ loop_counter: .long 0
                     self.assertTrue(all(r["writes"] for r in records))
                     self.assertFalse(any(line.startswith("L ") for line in
                                          (root / symbol / "object.plan").read_text().splitlines()))
+
+    def test_translation_rejects_values_outside_all_ranges_without_scanning(self):
+        class Address(int):
+            comparisons = 0
+
+            def __le__(self, other):
+                Address.comparisons += 1
+                return super().__le__(other)
+
+        ranges = oracle.AddressRanges([(Address(0x20000000 + i * 16), 8, 0x400000 + i * 8)
+                                       for i in range(1000)])
+        Address.comparisons = 0
+        self.assertEqual(oracle.translate(0x100000000000, ranges), 0x100000000000)
+        self.assertFalse(oracle.inside_ranges(0x100000000000, ranges))
+        self.assertLess(Address.comparisons, 4)
+        self.assertEqual(oracle.translate(0x20000002, ranges), 0x400002)
+        self.assertTrue(oracle.inside_ranges(0x20000002, ranges))
+        self.assertEqual(oracle.translate(0x20000008, ranges), 0x20000008)
+        # Overlapping aliases retain the first range's translation.
+        aliases = oracle.AddressRanges([(16, 16, 100), (8, 16, 200)])
+        self.assertEqual(oracle.translate(17, aliases), 101)
 
     def test_timeout_compares_only_completed_common_calls(self):
         call = {"to": "0x400000", "gp": ["0x1"] * 6, "xmm": [oracle.POISON] * 8,

@@ -60,6 +60,7 @@ struct call {
   struct regs regs;
   unsigned char deref[6][32];  // what each argument register points at, when it points into the stack or the variant
 };
+_Static_assert(sizeof(struct call) == 336, "binary call layout must match records.py");
 
 struct segment {
   uint64_t start, end;  // page-aligned
@@ -78,6 +79,7 @@ static struct call calls[MAX_CALLS];
 static int call_count;
 static uint64_t return_counter;
 static int out_fd;
+static int binary_records;
 
 // splitmix64
 static uint64_t mix(uint64_t x) {
@@ -155,8 +157,8 @@ static void fill(uint64_t page, unsigned char *to) {
   }
 }
 
-static void emit(const char *text) {
-  size_t n = strlen(text);
+static void emit_bytes(const void *data, size_t n) {
+  const char *text = data;
   while (n > 0) {
     ssize_t w = write(out_fd, text, n);
     if (w <= 0)
@@ -165,6 +167,8 @@ static void emit(const char *text) {
     n -= w;
   }
 }
+
+static void emit(const char *text) { emit_bytes(text, strlen(text)); }
 
 static void finish(const char *outcome, uint64_t detail, const struct result *result);
 static size_t hex(char *to, const unsigned char *from, size_t n);
@@ -430,7 +434,7 @@ static int loop_trap(ucontext_t *uc) {
 // Control transfers that require routing or form indirect boundaries. Direct followed calls run normally.
 struct branch {
   uint64_t insn, next, target, disp, start, end;
-  int base, index, scale, memory, call;
+  int base, index, scale, memory, call, direct;
 };
 static struct branch *branches;
 static size_t branch_count;
@@ -446,6 +450,53 @@ static int runnable_image(uint64_t address) {
 }
 
 void oracle_native(void);
+void oracle_boundary(void);
+uint64_t *oracle_boundary_saved_r11;
+uint64_t oracle_boundary_r10;
+
+// Bind five-byte direct boundaries to nearby stubs, preserving the original target and return site.
+// The first page holds the thunk pointer and saved r11; code pages become read/execute after setup.
+static void bind_boundaries(void) {
+  size_t count = 0;
+  for (size_t i = 0; i < branch_count; i++)
+    count += branches[i].direct;
+  if (!count)
+    return;
+  size_t size = PAGE + ((count * 32 + PAGE - 1) & ~(PAGE - 1));
+  unsigned char *area = mmap((void *)0x28000000, size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+  // A large variant may occupy this address. Keep the original trap path in that case.
+  if (area == MAP_FAILED)
+    return;
+  *(uint64_t *)area = (uint64_t)oracle_boundary;
+  oracle_boundary_saved_r11 = (uint64_t *)(area + 8);
+  size_t used = PAGE;
+  for (size_t i = 0; i < branch_count; i++) {
+    struct branch *b = &branches[i];
+    if (!b->direct)
+      continue;
+    unsigned char stub[] = {0x4c, 0x89, 0x1d, 0, 0, 0, 0, // mov r11, saved_r11(%rip)
+                            0x49, 0xbb, 0, 0, 0, 0, 0, 0, 0, 0, // movabs target, r11
+                            0xff, 0x25, 0, 0, 0, 0}; // jmp *thunk(%rip)
+    int32_t save = (area + 8) - (area + used + 7), thunk = area - (area + used + sizeof(stub));
+    memcpy(stub + 3, &save, 4);
+    memcpy(stub + 9, &b->target, 8);
+    memcpy(stub + 19, &thunk, 4);
+    memcpy(area + used, stub, sizeof(stub));
+    int64_t displacement = (uint64_t)(area + used) - b->next;
+    if (displacement < INT32_MIN || displacement > INT32_MAX)
+      continue;
+    uint64_t page = b->insn & ~(PAGE - 1), last = (b->next + PAGE - 1) & ~(PAGE - 1);
+    mprotect((void *)page, last - page, PROT_READ | PROT_WRITE);
+    *(unsigned char *)b->insn = b->call ? 0xe8 : 0xe9;
+    int32_t relative = displacement;
+    memcpy((void *)(b->insn + 1), &relative, 4);
+    mprotect((void *)page, last - page, PROT_READ | PROT_EXEC);
+    used += 32;
+    b->direct = 2;
+  }
+  mprotect(area + PAGE, size - PAGE, PROT_READ | PROT_EXEC);
+}
 
 static int branch_trap(ucontext_t *uc) {
   greg_t *g = uc->uc_mcontext.gregs;
@@ -525,10 +576,13 @@ static void load_plan(const char *path) {
         exit(1);
       plt_address[plt_count] = start;
       plt_name[plt_count++] = strdup(name);
-    } else if (line[0] == 'B') {
-      struct branch b;
-      if (sscanf(line, "B %lx %lx %lx %d %d %d %lx %d %d %lx %lx", &b.insn, &b.next, &b.target,
+    } else if (line[0] == 'B' || line[0] == 'D') {
+      struct branch b = {0};
+      b.direct = line[0] == 'D';
+      if (sscanf(line + 1, " %lx %lx %lx %d %d %d %lx %d %d %lx %lx", &b.insn, &b.next, &b.target,
                  &b.base, &b.index, &b.scale, &b.disp, &b.memory, &b.call, &b.start, &b.end) != 11)
+        exit(1);
+      if (b.direct && (b.next - b.insn != 5 || b.start || b.memory))
         exit(1);
       branches = realloc(branches, (branch_count + 1) * sizeof(*branches));
       branches[branch_count++] = b;
@@ -542,8 +596,10 @@ static void load_plan(const char *path) {
     uint64_t page = runnable[i].start & ~(PAGE - 1), last = (runnable[i].end + PAGE - 1) & ~(PAGE - 1);
     mprotect((void *)page, last - page, PROT_READ | PROT_EXEC);
   }
+  bind_boundaries();
   for (size_t i = 0; i < branch_count; i++)
-    set_byte(branches[i].insn, 0xcc);
+    if (branches[i].direct != 2)
+      set_byte(branches[i].insn, 0xcc);
   for (size_t i = 0; i < loop_count; i++) {
     loops[i].original = *(unsigned char *)loops[i].insn;
     set_byte(loops[i].insn, 0xcc);
@@ -581,6 +637,28 @@ static void handler(int signal, siginfo_t *info, void *context) {
 }
 
 static char line[1 << 22];
+static size_t line_limit = sizeof(line);
+
+// Binary frames contain metadata JSON, fixed-size calls, then length-prefixed names. The unused rax
+// field carries the dereference mask; name pointers become one-based indices.
+static struct call wire_calls[MAX_CALLS];
+static const char *wire_names[MAX_CALLS];
+static size_t wire_name_count;
+static const uint64_t wire_magic = 0x31304c4c4143524fUL;
+
+static size_t hex_digits(uint64_t n) { return n ? (64 - __builtin_clzll(n) + 3) / 4 : 1; }
+
+static size_t call_json_size(const struct call *c, int comma, uint64_t mask) {
+  size_t n = sizeof("{\"site\":\"0x\",\"to\":\"0x\",\"gp\":[],\"deref\":[],\"xmm\":[]}") - 1;
+  n += comma + hex_digits(c->regs.site) + hex_digits(c->target);
+  if (c->name)
+    n += strlen(c->name) + 1;
+  for (int r = 0; r < 6; r++)
+    n += 4 + hex_digits(c->regs.gp[r]) + (r != 0) + 2 + ((mask >> r) & 1) * 64 + (r != 0);
+  for (int r = 0; r < 8; r++)
+    n += 4 + hex_digits(c->regs.xmm[r]) + (r != 0);
+  return n;
+}
 
 static size_t hex(char *to, const unsigned char *from, size_t n) {
   static const char digits[] = "0123456789abcdef";
@@ -595,7 +673,7 @@ static size_t hex(char *to, const unsigned char *from, size_t n) {
 static size_t writes(char *to, size_t used, uint64_t start, const unsigned char *now, const unsigned char *before, size_t n,
                      int *first) {
   size_t i = 0;
-  while (i < n && used < sizeof(line) - 256) {
+  while (i < n && used + 256 < line_limit) {
     if (now[i] == before[i]) {
       i++;
       continue;
@@ -609,7 +687,7 @@ static size_t writes(char *to, size_t used, uint64_t start, const unsigned char 
         break;
       j += w;
     }
-    if (used + 64 + 2 * (j - i) >= sizeof(line))
+    if (used + 64 + 2 * (j - i) >= line_limit)
       break;
     used += sprintf(to + used, "%s[\"0x%lx\",\"", *first ? "" : ",", start + i);
     used += hex(to + used, now + i, j - i);
@@ -621,13 +699,39 @@ static size_t writes(char *to, size_t used, uint64_t start, const unsigned char 
 }
 
 static void finish(const char *outcome, uint64_t detail, const struct result *result) {
+  // The execution outcome is settled. Output backpressure must not start a second, partial record.
+  sigset_t blocked;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGALRM);
+  sigprocmask(SIG_BLOCK, &blocked, NULL);
+  alarm(0);
   size_t n = sprintf(line, "{\"seed\":%lu,\"outcome\":\"%s\",\"detail\":\"0x%lx\"", seed, outcome, detail);
   if (result)
     n += sprintf(line + n, ",\"rax\":\"0x%lx\",\"rdx\":\"0x%lx\",\"xmm0\":\"0x%lx\",\"xmm1\":\"0x%lx\"", result->rax,
                  result->rdx, result->xmm0, result->xmm1);
   n += sprintf(line + n, ",\"calls\":[");
-  for (int i = 0; i < call_count && n < sizeof(line) - 1024; i++) {
+  size_t skipped = 0, wire_count = 0;
+  for (int i = 0; i < call_count && n + skipped < sizeof(line) - 1024; i++) {
     struct call *c = &calls[i];
+    if (binary_records) {
+      uint64_t mask = 0;
+      for (int r = 0; r < 6; r++)
+        if (local(c->regs.gp[r]))
+          mask |= 1UL << r;
+      skipped += call_json_size(c, i != 0, mask);
+      size_t name = 0;
+      if (c->name) {
+        while (name < wire_name_count && strcmp(wire_names[name], c->name) != 0)
+          name++;
+        if (name == wire_name_count)
+          wire_names[wire_name_count++] = c->name;
+        name++;
+      }
+      wire_calls[wire_count] = *c;
+      wire_calls[wire_count].name = (const char *)name;
+      wire_calls[wire_count++].regs.rax = mask;
+      continue;
+    }
     n += sprintf(line + n, "%s{\"site\":\"0x%lx\",\"to\":\"%s%s0x%lx\",\"gp\":[", i ? "," : "", c->regs.site,
                  c->name ? c->name : "", c->name ? "@" : "",
                  c->target);
@@ -646,6 +750,8 @@ static void finish(const char *outcome, uint64_t detail, const struct result *re
     n += sprintf(line + n, "]}");
   }
   n += sprintf(line + n, "],\"writes\":[");
+  // Retain the original JSON byte budget, including its call and write truncation points.
+  line_limit -= skipped;
   int first = 1;
   static unsigned char before[PAGE];
   for (int i = 0; i < page_count; i++) {
@@ -657,7 +763,19 @@ static void finish(const char *outcome, uint64_t detail, const struct result *re
       n = writes(line, n, image[i].start, (unsigned char *)image[i].start, image[i].pristine, image[i].end - image[i].start,
                  &first);
   n += sprintf(line + n, "],\"pages\":%d}\n", page_count);
-  emit(line);
+  if (binary_records) {
+    uint64_t header[] = {wire_magic, n, wire_count, wire_name_count};
+    emit_bytes(header, sizeof(header));
+    emit_bytes(line, n);
+    emit_bytes(wire_calls, wire_count * sizeof(*wire_calls));
+    for (size_t i = 0; i < wire_name_count; i++) {
+      uint64_t length = strlen(wire_names[i]);
+      emit_bytes(&length, sizeof(length));
+      emit_bytes(wire_names[i], length);
+    }
+  } else {
+    emit(line);
+  }
   _exit(0);
 }
 
@@ -734,6 +852,27 @@ __asm__(".text\n"
         "  mov %rsp, oracle_thunk_saved_rsp(%rip); lea oracle_thunk_stack+65536(%rip), %rsp\n"
         "  call oracle_native_c\n"
         "  mov oracle_thunk_saved_rsp(%rip), %rsp; ret\n"
+        ".globl oracle_boundary\n"
+        "oracle_boundary:\n"
+        "  mov %r10, oracle_boundary_r10(%rip)\n"
+        "  mov %rsp, oracle_thunk_saved_rsp(%rip); lea oracle_thunk_stack+65536(%rip), %rsp\n"
+        "  pushfq; push %rbp; mov %rsp, %rbp; sub $688, %rsp; and $-16, %rsp\n"
+        "  mov %rdi, 0(%rsp); mov %rsi, 8(%rsp); mov %rdx, 16(%rsp); mov %rcx, 24(%rsp); mov %r8, 32(%rsp)\n"
+        "  mov %r9, 40(%rsp); movq %xmm0, 48(%rsp); movq %xmm1, 56(%rsp); movq %xmm2, 64(%rsp); movq %xmm3, 72(%rsp)\n"
+        "  movq %xmm4, 80(%rsp); movq %xmm5, 88(%rsp); movq %xmm6, 96(%rsp); movq %xmm7, 104(%rsp); mov %rax, 112(%rsp)\n"
+        "  mov oracle_thunk_saved_rsp(%rip), %r10; mov (%r10), %r10; mov %r10, 120(%rsp)\n"
+        "  fxsave64 160(%rsp)\n"
+        "  mov %r11, %rdi; mov %rsp, %rsi; lea 128(%rsp), %rdx; call oracle_native_c\n"
+        "  fxrstor64 160(%rsp)\n"
+        "  mov 128(%rsp), %rax; mov 136(%rsp), %rdx; movlps 144(%rsp), %xmm0; movlps 152(%rsp), %xmm1\n"
+        "  movabs $0x0badc0de0badc0de, %rdi; mov %rdi, %rsi; mov %rdi, %rcx; mov %rdi, %r8; mov %rdi, %r9\n"
+        "  mov %rdi, 672(%rsp)\n"
+        "  movlps 672(%rsp), %xmm2; movlps 672(%rsp), %xmm3; movlps 672(%rsp), %xmm4\n"
+        "  movlps 672(%rsp), %xmm5; movlps 672(%rsp), %xmm6; movlps 672(%rsp), %xmm7\n"
+        "  leave; popfq\n"
+        "  mov oracle_boundary_r10(%rip), %r10\n"
+        "  mov oracle_boundary_saved_r11(%rip), %r11; mov (%r11), %r11\n"
+        "  mov oracle_thunk_saved_rsp(%rip), %rsp; ret\n"
         ".globl oracle_thunk\n"
         "oracle_thunk:\n"
         "  mov %rsp, oracle_thunk_saved_rsp(%rip); lea oracle_thunk_stack+65536(%rip), %rsp\n"
@@ -761,6 +900,7 @@ int main(int argc, char **argv) {
   if (argc != 7)
     return fprintf(stderr, "usage: harness IMAGE VARIANT ENTRY ARGSPEC SEED COUNT\n"), 2;
   uint64_t entry = strtoull(argv[3], NULL, 0);
+  binary_records = getenv("ORACLE_BINARY") != NULL;
   const char *spec = argv[4];
   uint64_t first = strtoull(argv[5], NULL, 0), count = strtoull(argv[6], NULL, 0);
   seed = 0;  // the image's generated .bss contents use seed 0, the same for every case and variant
@@ -867,13 +1007,22 @@ int main(int argc, char **argv) {
     char buffer[1 << 16];
     ssize_t n;
     while ((n = read(fds[0], buffer, sizeof(buffer))) > 0)
-      fwrite(buffer, 1, n, stdout);
+      if (fwrite(buffer, 1, n, stdout) != (size_t)n)
+        return perror("record output"), 3;
     close(fds[0]);
     int status;
     waitpid(pid, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-      printf("{\"seed\":%lu,\"outcome\":\"lost\",\"detail\":\"0x%x\",\"calls\":[],\"writes\":[]}\n", s, status);
-    fflush(stdout);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      char lost[256];
+      size_t length = sprintf(lost, "{\"seed\":%lu,\"outcome\":\"lost\",\"detail\":\"0x%x\",\"calls\":[],\"writes\":[]}\n", s, status);
+      if (binary_records) {
+        uint64_t header[] = {wire_magic, length, 0, 0};
+        fwrite(header, 1, sizeof(header), stdout);
+      }
+      fwrite(lost, 1, length, stdout);
+    }
+    if (fflush(stdout) != 0)
+      return perror("record output"), 3;
   }
   return 0;
 }

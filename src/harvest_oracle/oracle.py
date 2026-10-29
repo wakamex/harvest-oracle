@@ -10,6 +10,7 @@ arguments, and every word written to generated memory or the executable's global
 """
 
 import bisect
+import contextlib
 import functools
 import hashlib
 import json
@@ -19,6 +20,8 @@ import subprocess
 import tempfile
 from importlib import resources
 from pathlib import Path
+
+from .records import PackedCalls, decode_records, read_records, record_json
 
 BASE = 0x20000000
 # A version given as this path runs the original executable's own code of the function in place.
@@ -264,7 +267,8 @@ def execution_plan(harvest, elf, entry, function, follow, out):
                 elif target >= BASE and elf != "-" and target not in allocator_addresses:
                     # Named stubs and decompiler adapters keep their existing mechanism.
                     continue
-                rows.append(f"B {address:x} {address + length:x} {target:x} -1 -1 1 0 {2 if target in extents else 0} {int(op.startswith('call'))} 0 0")
+                kind = "D" if length == 5 and target not in extents else "B"
+                rows.append(f"{kind} {address:x} {address + length:x} {target:x} -1 -1 1 0 {2 if target in extents else 0} {int(op.startswith('call'))} 0 0")
             else:
                 operand = arg[1:]
                 base = index = -1
@@ -466,7 +470,7 @@ def link(harvest, name, obj, function, out, pad=False):
     # Indirect calls to a local copy retain the original callee identity. Stored code pointers likewise
     # compare by their executable address rather than the version's link address.
     ranges += [(address, size, known[n]) for n, (address, size) in functions(elf).items() if n in known]
-    return elf, addresses[function], (addresses["oracle_thunk_slot"], native), stubs, ranges
+    return elf, addresses[function], (addresses["oracle_thunk_slot"], native), stubs, AddressRanges(ranges)
 
 
 def translations(linker_map, known):
@@ -481,7 +485,21 @@ def translations(linker_map, known):
     return ranges
 
 
+class AddressRanges(list):
+    """Translation ranges with a constant-time rejection of unrelated addresses."""
+
+    def __init__(self, ranges):
+        super().__init__(ranges)
+        self.lower = min((start for start, _, _ in self), default=0)
+        self.upper = max((start + size for start, size, _ in self), default=0)
+
+    def may_contain(self, value):
+        return self.lower <= value < self.upper
+
+
 def translate(value, ranges):
+    if isinstance(ranges, AddressRanges) and not ranges.may_contain(value):
+        return value
     for start, size, image in ranges:
         if start <= value < start + size:
             return image + (value - start)
@@ -759,9 +777,12 @@ def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_
     return execute_range(harvest, elf, entry, slot, spec, cases, own, guard_list=guard_list, plan=plan)
 
 
-def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list="", plan=None):
+def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list="", plan=None, binary=True,
+                  output=None):
     thunk, native = slot if isinstance(slot, tuple) else (slot, None)
     env = {"ORACLE_THUNK_SLOT": f"0x{thunk:x}"} if thunk else {}
+    if binary:
+        env["ORACLE_BINARY"] = "1"
     if native:
         env["ORACLE_NATIVE_SLOT"] = f"0x{native:x}"
     env["ORACLE_PLT"] = harvest.plt
@@ -774,9 +795,19 @@ def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, gua
     if own and not plan:
         text = text_section(harvest.image)
         env.update(ORACLE_IMAGE_FUNCTION=f"0x{own[0]:x}:{own[1]}", ORACLE_TEXT=f"0x{text[0]:x}:0x{text[1]:x}")
-    output = subprocess.run([str(harness_binary()), str(harvest.image), str(elf), f"0x{entry:x}", spec, str(first),
-                             str(cases)], check=True, capture_output=True, text=True, env=env).stdout
-    return [json.loads(line) for line in output.splitlines()]
+    if output is None:
+        cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle"
+        cache.mkdir(parents=True, exist_ok=True)
+        destination = tempfile.TemporaryFile(dir=cache)
+    else:
+        destination = contextlib.nullcontext(output)
+    with destination as output:
+        subprocess.run([str(harness_binary()), str(harvest.image), str(elf), f"0x{entry:x}", spec, str(first),
+                        str(cases)], check=True, stdout=output, stderr=subprocess.PIPE, env=env)
+        if binary:
+            return read_records(output)
+        output.seek(0)
+        return [json.loads(line) for line in output]
 
 
 GP_NAMES = [("rdi", "edi", "di", "dil"), ("rsi", "esi", "si", "sil"), ("rdx", "edx", "dx", "dl"),
@@ -836,19 +867,26 @@ def cached_run(harvest, elf, entry, slot, spec, cases, own=None, guard_list="", 
               harvest.plt, text_section(harvest.image) if plan or own else None]
     key = hashlib.sha256(json.dumps(inputs).encode()).hexdigest()
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle" / "runs"
-    path = cache / f"{key}.json"
+    path = cache / f"{key}.bin"
     if path.exists():
-        return json.loads(path.read_text())
-    result = execute(harvest, elf, entry, slot, spec, cases, own=own, guard_list=guard_list, plan=plan)
+        with path.open("rb") as stream:
+            return read_records(stream)
     cache.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(result))
-    temporary.replace(path)
+    try:
+        with temporary.open("w+b") as output:
+            result = execute_range(harvest, elf, entry, slot, spec, cases, own=own, guard_list=guard_list, plan=plan,
+                                   output=output)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return result
 
 
 def inside_ranges(value, *range_lists):
-    return any(start <= value < start + size for ranges in range_lists for start, size, _ in ranges)
+    return any(start <= value < start + size for ranges in range_lists
+               if not isinstance(ranges, AddressRanges) or ranges.may_contain(value)
+               for start, size, _ in ranges)
 
 
 def call_identity(call, names, ranges=()):
@@ -859,8 +897,49 @@ def call_identity(call, names, ranges=()):
     return names.get(address, hex(address))
 
 
+def call_identities(calls, names, ranges):
+    if not isinstance(calls, PackedCalls):
+        return tuple(call_identity(c, names, ranges) for c in calls)
+    identities = {}
+    result = []
+    for target, name in calls.targets():
+        key = target, name
+        if key not in identities:
+            identities[key] = (calls.names[name - 1].split("@")[0] if name else
+                               call_identity({"to": hex(target)}, names, ranges))
+        result.append(identities[key])
+    return tuple(result)
+
+
+def call_pairs(a, b, ranges_a, ranges_b, names, signatures):
+    """Stream equal known calls without building their diagnostic dictionaries.
+
+    This is only a sufficient equality check. Unknown signatures, translated arguments and unequal
+    captures use the full comparator, including its string, pointer and register-setup rules.
+    """
+    if not isinstance(a, PackedCalls) or not isinstance(b, PackedCalls):
+        yield from zip(a, b)
+        return
+    rules = {}
+    for i, (x, y) in enumerate(zip(a.rows(), b.rows())):
+        key = x[:2], y[:2]
+        if key not in rules:
+            ix = a.names[x[1] - 1].split("@")[0] if x[1] else call_identity({"to": hex(x[0])}, names, ranges_a)
+            iy = b.names[y[1] - 1].split("@")[0] if y[1] else call_identity({"to": hex(y[0])}, names, ranges_b)
+            rules[key] = signatures.get(ix) if ix == iy else None
+        count = rules[key]
+        if count:
+            gp, xmm = count
+            if (x[2:2 + gp] == y[2:2 + gp] and x[8:8 + xmm] == y[8:8 + xmm]
+                    and not ((x[16] ^ y[16]) & ((1 << gp) - 1)) and x[18][:32 * gp] == y[18][:32 * gp]
+                    and not any(inside_ranges(value, ranges_a, ranges_b) for value in x[2:2 + gp])):
+                yield None, None
+                continue
+        yield a[i], b[i]
+
+
 def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, return_kind, setups_a=None,
-                     setups_b=None, string_arguments=None):
+                     setups_b=None, string_arguments=None, first_only=False):
     """How case A and case B differ, as a list of short descriptions; empty when they agree."""
     diffs = []
     if a["outcome"] != b["outcome"]:
@@ -875,7 +954,11 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
             register, mask = masks[return_kind]
             if int(a[register], 16) & mask != int(b[register], 16) & mask:
                 diffs.append(f"return {a[register]} vs {b[register]}")
-    for i, (x, y) in enumerate(zip(a["calls"], b["calls"])):
+    if diffs and first_only:
+        return diffs
+    for i, (x, y) in enumerate(call_pairs(a["calls"], b["calls"], ranges_a, ranges_b, names, signatures)):
+        if x is None:
+            continue
         ix, iy = call_identity(x, names, ranges_a), call_identity(y, names, ranges_b)
         if ix != iy:
             diffs.append(f"call {i}: {ix} vs {iy}")
@@ -952,6 +1035,8 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
         if count and x["xmm"][: count[1]] != y["xmm"][: count[1]]:
             diffs.append(f"call {i} {ix} float args {x['xmm'][:count[1]]} vs {y['xmm'][:count[1]]}")
             break
+    if diffs and first_only:
+        return diffs
     # Both executions reached every completed call in their shared prefix. The longer tail of two
     # alarm-limited traces reflects elapsed time, so it cannot establish a behavioral difference.
     if (len(a["calls"]) != len(b["calls"]) and not diffs
@@ -1011,11 +1096,13 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             stub_lists[name] = stubs
             describe_callees(stubs, signatures, pointee, string_arguments)
             if out:
-                (directory / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results[name]))
+                with (directory / f"{name}.jsonl").open("w") as stream:
+                    for record in results[name]:
+                        stream.write(json.dumps(record, default=record_json) + "\n")
 
-        def differs(a, b, ra, rb, sa=None, sb=None):
+        def differs(a, b, ra, rb, sa=None, sb=None, first_only=False):
             return case_differences(a, b, ra, rb, harvest.names, signatures, pointee, return_kind, sa, sb,
-                                    string_arguments)
+                                    string_arguments, first_only)
 
         reference, *others = list(results)
         # A case in which any version reads past a static table it indexes is undefined: what lies past the
@@ -1023,7 +1110,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         undefined = {i for rs in results.values() for i, r in enumerate(rs) if r["outcome"] == "undefined"}
         differing = {other: [i for i, (a, b) in enumerate(zip(results[reference], results[other]))
                              if i not in undefined and differs(a, b, ranges[reference], ranges[other],
-                                                               setups[reference], setups[other])]
+                                                               setups[reference], setups[other], first_only=True)]
                      for other in others}
         # Layout check: a differing case that some version answers differently once its own data moves depends
         # on that layout (an out-of-range index into a static table, a value derived from an address), not on
@@ -1036,7 +1123,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             moved = execute(harvest, elf, entry, slot, spec, None, plan=plan, seeds=[i + 1 for i in suspects],
                             guard_list=guards(elf))
             for i, again in zip(suspects, moved):
-                if differs(results[name][i], again, ranges[name], padded_ranges):
+                if differs(results[name][i], again, ranges[name], padded_ranges, first_only=True):
                     layout_dependent.add(i)
     comparison = {}
     for other in others:
@@ -1052,7 +1139,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         for r in rs:
             outcomes[n][r["outcome"]] = outcomes[n].get(r["outcome"], 0) + 1
     # Distinct behaviors per version, by outcome, fault address and the sequence of callees.
-    coverage = {n: len({(r["outcome"], r["detail"], tuple(call_identity(c, harvest.names, ranges[n]) for c in r["calls"]))
+    coverage = {n: len({(r["outcome"], r["detail"], call_identities(r["calls"], harvest.names, ranges[n]))
                         for r in rs}) for n, rs in results.items()}
     return {"function": function, "signature": signature, "argument_spec": spec, "returns": return_kind,
             "cases": cases, "outcomes": outcomes, "distinct_behaviors": coverage, "named_stubs": stub_lists,
