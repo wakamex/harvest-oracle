@@ -768,22 +768,28 @@ def text_section(image):
     raise SystemExit(f"{image} has no .text section")
 
 
-def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_list="", plan=None, budget=None):
+def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_list="", plan=None, budget=None,
+            keep_writes=True, pages=None):
     """Run the harness on seeds 1 to CASES, or on SEEDS. ELF is a linked version, or "-" with
     OWN = (start, size) to run the executable's own code of the function in place."""
     if seeds is not None:
         return [r for seed in seeds
-                for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed, guard_list=guard_list, plan=plan, budget=budget)]
-    return execute_range(harvest, elf, entry, slot, spec, cases, own, guard_list=guard_list, plan=plan, budget=budget)
+                for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed, guard_list=guard_list,
+                                       plan=plan, budget=budget, keep_writes=keep_writes, pages=pages)]
+    return execute_range(harvest, elf, entry, slot, spec, cases, own, guard_list=guard_list, plan=plan, budget=budget,
+                         keep_writes=keep_writes, pages=pages)
 
 
 def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list="", plan=None, binary=True,
-                  output=None, budget=None):
+                  output=None, budget=None, keep_writes=True, pages=None):
     thunk, native = slot if isinstance(slot, tuple) else (slot, None)
     env = {"ORACLE_THUNK_SLOT": f"0x{thunk:x}"} if thunk else {}
     env["ORACLE_INSTRUCTION_BUDGET"] = str(instruction_budget() if budget is None else budget)
+    env["ORACLE_PAGE_BUDGET"] = str(page_budget() if pages is None else pages)
     if os.environ.get("ORACLE_MEASURE_INSTRUCTIONS"):
         env["ORACLE_MEASURE_INSTRUCTIONS"] = "1"
+    if not keep_writes:
+        env["ORACLE_COMPARE_ONLY"] = "1"
     if binary:
         env["ORACLE_BINARY"] = "1"
     if native:
@@ -853,6 +859,12 @@ def _integer_setups(path, size, mtime, start, end):
 
 INSTRUCTION_BUDGET = 1_000_000_000
 RETRY_MULTIPLIER = 100
+PAGE_BUDGET = 400
+MAX_PAGES = 8192
+
+
+def page_budget():
+    return min(MAX_PAGES, max(0, int(os.environ.get("ORACLE_PAGE_BUDGET", PAGE_BUDGET))))
 
 
 def instruction_budget():
@@ -864,12 +876,12 @@ def counter_status():
                env={"ORACLE_INSTRUCTION_BUDGET": str(instruction_budget())}).strip()
 
 
-def cached_image_run(harvest, start, size, spec, cases, plan=None):
+def cached_image_run(harvest, start, size, spec, cases, plan=None, keep_writes=True):
     """Keep image execution on the same cache contract as linked object execution."""
-    return cached_run(harvest, "-", start, None, spec, cases, own=(start, size), plan=plan)
+    return cached_run(harvest, "-", start, None, spec, cases, own=(start, size), plan=plan, keep_writes=keep_writes)
 
 
-def cached_run(harvest, elf, entry, slot, spec, cases, own=None, guard_list="", plan=None):
+def cached_run(harvest, elf, entry, slot, spec, cases, own=None, guard_list="", plan=None, keep_writes=True):
     """Reuse records only for identical machine code and complete harness inputs, independent of filenames.
 
     Explicit seed reruns for the layout check still execute directly. Like image records, cached object
@@ -882,7 +894,7 @@ def cached_run(harvest, elf, entry, slot, spec, cases, own=None, guard_list="", 
     inputs = [digest(harvest.image), digest(elf) if str(elf) != "-" else None, digest(harness_binary()),
               entry, slot, spec, cases, own, guard_list, plan.read_text() if plan else None,
               harvest.plt, text_section(harvest.image) if plan or own else None,
-              instruction_budget(), status, bool(os.environ.get("ORACLE_MEASURE_INSTRUCTIONS"))]
+              instruction_budget(), page_budget(), status, bool(os.environ.get("ORACLE_MEASURE_INSTRUCTIONS")), keep_writes]
     key = hashlib.sha256(json.dumps(inputs).encode()).hexdigest()
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle" / "runs"
     path = cache / f"{key}.bin"
@@ -894,7 +906,7 @@ def cached_run(harvest, elf, entry, slot, spec, cases, own=None, guard_list="", 
     try:
         with temporary.open("w+b") as output:
             result = execute_range(harvest, elf, entry, slot, spec, cases, own=own, guard_list=guard_list, plan=plan,
-                                   output=output)
+                                   output=output, keep_writes=keep_writes)
         # A temporary scheduling failure must not poison a cache keyed by a working probe.
         if all(str(r.get("execution_limit", {}).get("error", -1)) == status for r in result):
             temporary.replace(path)
@@ -1072,8 +1084,8 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
 
 def budget_mismatch(a, b):
     terminal = {"return", "crash", "fpe", "ill", "bus", "signal", "too-many-calls"}
-    return ((a.get("timeout_reason") == "instruction-budget" and b["outcome"] in terminal)
-            or (b.get("timeout_reason") == "instruction-budget" and a["outcome"] in terminal))
+    return ((a.get("timeout_reason") in {"instruction-budget", "page-budget"} and b["outcome"] in terminal)
+            or (b.get("timeout_reason") in {"instruction-budget", "page-budget"} and a["outcome"] in terminal))
 
 
 def execution_limit_summary(results):
@@ -1091,7 +1103,9 @@ def execution_limit_summary(results):
             if record["outcome"] == "timeout":
                 reason = record.get("timeout_reason", "unknown")
                 reasons[reason] = reasons.get(reason, 0) + 1
-        summary[name] = {"modes": modes, "fallback_errors": errors, "timeout_reasons": reasons}
+        page_limits = sorted({r["execution_limit"]["pages"] for r in records
+                              if "pages" in r.get("execution_limit", {})})
+        summary[name] = {"page_budgets": page_limits, "modes": modes, "fallback_errors": errors, "timeout_reasons": reasons}
         if errors:
             summary[name]["note"] = "Instruction counter unavailable; using the two-second wall-clock limit: " + "; ".join(
                 os.strerror(error) for error in errors)
@@ -1130,13 +1144,14 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                 start, size = harvest.known[function], harvest.sizes[function]
                 stubs, ranges[name] = [], []
                 plan = execution_plan(harvest, "-", start, function, follow, directory)
-                results[name] = cached_image_run(harvest, start, size, spec, cases, plan)
+                results[name] = cached_image_run(harvest, start, size, spec, cases, plan, keep_writes=bool(out))
                 executions[name] = ("-", start, None, (start, size), "", plan)
                 setups[name] = integer_setups(harvest.image, 0, BASE)
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
                 plan = execution_plan(harvest, elf, entry, function, follow, directory)
-                results[name] = cached_run(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf), plan=plan)
+                results[name] = cached_run(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf), plan=plan,
+                                           keep_writes=bool(out))
                 executions[name] = (elf, entry, slot, None, guards(elf), plan)
                 setups[name] = {**integer_setups(harvest.image, 0, BASE), **integer_setups(elf, BASE, 1 << 64)}
                 # The same version with its own data 4 KB further on, for the layout check.
@@ -1151,8 +1166,8 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                                     string_arguments, first_only)
 
         reference, *others = list(results)
-        # Instruction counts depend on generated code and harness work. Confirm a one-sided
-        # budget exhaustion with a larger allowance before it can establish an outcome difference.
+        # Generated memory and instructions share each case's limits across all followed bodies.
+        # Confirm a one-sided exhaustion with larger allowances before comparing the outcomes.
         budget_retries = {other: sorted(i for i, (a, b) in enumerate(zip(results[reference], results[other]))
                                         if budget_mismatch(a, b)) for other in others}
         retry_indices = sorted({i for indices in budget_retries.values() for i in indices})
@@ -1162,7 +1177,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             ordered = sorted(indices)
             again = execute(harvest, elf, entry, slot, spec, None, own=own, guard_list=guard_list,
                             plan=plan, seeds=[i + 1 for i in ordered],
-                            budget=instruction_budget() * RETRY_MULTIPLIER)
+                            budget=instruction_budget() * RETRY_MULTIPLIER, keep_writes=bool(out), pages=MAX_PAGES)
             for i, record in zip(ordered, again):
                 results[name][i] = record
         if out:
@@ -1189,7 +1204,8 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             moved = [record for i in suspects
                      for record in execute(harvest, elf, entry, slot, spec, None, plan=plan, seeds=[i + 1],
                                            guard_list=guards(elf), budget=instruction_budget() *
-                                           (RETRY_MULTIPLIER if i in retry_indices else 1))]
+                                           (RETRY_MULTIPLIER if i in retry_indices else 1), keep_writes=bool(out),
+                                           pages=MAX_PAGES if i in retry_indices else page_budget())]
             for i, again in zip(suspects, moved):
                 if differs(results[name][i], again, ranges[name], padded_ranges, first_only=True):
                     layout_dependent.add(i)

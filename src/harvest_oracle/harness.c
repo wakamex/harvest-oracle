@@ -79,11 +79,13 @@ static uint64_t image_text_start, image_text_end;
 static uint64_t seed;
 static uint64_t pages[MAX_PAGES];
 static int page_count;
+// The measured returning-case maximum is 196 pages; retain 204 pages of headroom.
+static unsigned int page_budget = 400;
 static struct call calls[MAX_CALLS];
 static int call_count;
 static uint64_t return_counter;
 static int out_fd;
-static int binary_records;
+static int binary_records, compare_only;
 static int instruction_fd = -1, instruction_error;
 static uint64_t instruction_budget = 1000000000;
 static int measure_instructions;
@@ -146,7 +148,8 @@ static const uint32_t aligned_floats[] = {
 // float field read from memory filled with pointers still sees NaN, the infinities and ordinary values.
 static uint64_t region_pointer(uint64_t h) {
   uint64_t high = ((h >> 12) % (REGION_SIZE / 2 >> 32)) << 32;
-  uint64_t low = (h >> 40) & 1 ? aligned_floats[(h >> 44) & 15] : (h >> 4) & 0xfffffff0UL;
+  uint64_t mask = -((h >> 40) & 1);
+  uint64_t low = (aligned_floats[(h >> 44) & 15] & mask) | (((h >> 4) & 0xfffffff0UL) & ~mask);
   return REGION_BASE + high + low;
 }
 
@@ -159,7 +162,7 @@ static const uint32_t special_floats[] = {
   0x3f800000, 0xbf800000, 0x00000001, 0x7f7fffff, 0x41200000, 0xc2c80000, 0x3dcccccd, 0x447a0000,
 };
 
-static uint64_t word(uint64_t h) {
+static inline __attribute__((always_inline)) uint64_t word(uint64_t h) {
   // Half the seeds follow pointers: pointers and zero (which ends lists and trees) only.
   if ((seed & 3) == 1 || (seed & 3) == 2) {
     if ((h & 15) < 13)
@@ -186,7 +189,7 @@ static uint64_t word(uint64_t h) {
   }
 }
 
-static uint64_t word_at(uint64_t address) { return word(mix(seed ^ mix(address))); }
+static inline __attribute__((always_inline)) uint64_t word_at(uint64_t address) { return word(mix(seed ^ mix(address))); }
 
 static void fill(uint64_t page, unsigned char *to) {
   for (uint64_t offset = 0; offset < PAGE; offset += 8) {
@@ -218,6 +221,12 @@ static int map_region_page(uint64_t address) {
   void *p = mmap((void *)page, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
   if (p != (void *)page)
     return 0;
+  // Only a new mapping consumes the budget. An indirect read can revisit an existing page.
+  if (page_count == page_budget) {
+    munmap(p, PAGE);
+    timeout_reason = "page-budget";
+    finish("timeout", address, NULL);
+  }
   fill(page, p);
   pages[page_count++] = page;
   return 1;
@@ -805,17 +814,20 @@ static void finish(const char *outcome, uint64_t detail, const struct result *re
   line_limit -= skipped;
   int first = 1;
   static unsigned char before[PAGE];
-  for (int i = 0; i < page_count; i++) {
-    fill(pages[i], before);
-    n = writes(line, n, pages[i], (unsigned char *)pages[i], before, PAGE, &first);
+  // Only returning cases compare writes. Diagnostic exports retain every outcome's writes.
+  if (!compare_only || result) {
+    for (int i = 0; i < page_count; i++) {
+      fill(pages[i], before);
+      n = writes(line, n, pages[i], (unsigned char *)pages[i], before, PAGE, &first);
+    }
+    for (int i = 0; i < image_count; i++)
+      if (image[i].writable)
+        n = writes(line, n, image[i].start, (unsigned char *)image[i].start, image[i].pristine, image[i].end - image[i].start,
+                   &first);
   }
-  for (int i = 0; i < image_count; i++)
-    if (image[i].writable)
-      n = writes(line, n, image[i].start, (unsigned char *)image[i].start, image[i].pristine, image[i].end - image[i].start,
-                 &first);
   n += sprintf(line + n, "],\"pages\":%d", page_count);
-  n += sprintf(line + n, ",\"execution_limit\":{\"mode\":\"%s\",\"budget\":%lu,\"error\":%d}",
-               instruction_fd >= 0 ? "instructions" : "wall-clock", instruction_budget, instruction_error);
+  n += sprintf(line + n, ",\"execution_limit\":{\"mode\":\"%s\",\"budget\":%lu,\"error\":%d,\"pages\":%u}",
+               instruction_fd >= 0 ? "instructions" : "wall-clock", instruction_budget, instruction_error, page_budget);
   if (measure_instructions)
     n += sprintf(line + n, ",\"instructions\":%lu", instructions);
   if (strcmp(outcome, "timeout") == 0)
@@ -955,6 +967,11 @@ void oracle_thunk(void);
 void oracle_native(void);
 
 int main(int argc, char **argv) {
+  const char *page_limit = getenv("ORACLE_PAGE_BUDGET");
+  if (page_limit) {
+    uint64_t value = strtoull(page_limit, NULL, 0);
+    page_budget = value > MAX_PAGES ? MAX_PAGES : value;
+  }
   const char *budget = getenv("ORACLE_INSTRUCTION_BUDGET");
   if (budget)
     instruction_budget = strtoull(budget, NULL, 0);
@@ -968,6 +985,7 @@ int main(int argc, char **argv) {
     return fprintf(stderr, "usage: harness IMAGE VARIANT ENTRY ARGSPEC SEED COUNT\n"), 2;
   uint64_t entry = strtoull(argv[3], NULL, 0);
   binary_records = getenv("ORACLE_BINARY") != NULL;
+  compare_only = getenv("ORACLE_COMPARE_ONLY") != NULL;
   const char *spec = argv[4];
   uint64_t first = strtoull(argv[5], NULL, 0), count = strtoull(argv[6], NULL, 0);
   seed = 0;  // the image's generated .bss contents use seed 0, the same for every case and variant

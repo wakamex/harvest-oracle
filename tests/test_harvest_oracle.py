@@ -1,6 +1,7 @@
 """Tests on a synthetic checkout: a small fixed-address executable stands in for Harvest's."""
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -197,6 +198,131 @@ void trace(unsigned char *p) {
             captured = sum(len(data) // 2 for _, data in packed[0]["writes"])
             self.assertGreater(captured, 0)
             self.assertLess(captured, 1048576)
+
+    def test_generated_page_bytes_are_stable(self):
+        # A fixed digest covers every byte in 256 pages across all four generator modes.
+        source = self.root / "page-bytes.c"
+        source.write_text('''#define main harness_main
+#include "harness.c"
+#undef main
+int main(void) {
+  unsigned char buffer[PAGE];
+  for (seed = 0; seed < 32; seed++)
+    for (uint64_t i = 0; i < 8; i++) {
+      fill(REGION_BASE + (mix(i) % REGION_SIZE & ~(PAGE-1)), buffer);
+      if (fwrite(buffer, 1, PAGE, stdout) != PAGE) return 1;
+    }
+  return 0;
+}
+''')
+        binary = self.root / "page-bytes"
+        harness = oracle.resources.files("harvest_oracle").joinpath("harness.c")
+        run(["gcc", "-O2", "-fPIE", "-pie", "-I", str(Path(str(harness)).parent),
+             "-o", str(binary), str(source), "-lm"])
+        data = subprocess.run([str(binary)], check=True, capture_output=True).stdout
+        self.assertEqual(len(data), 256 * 4096)
+        self.assertEqual(hashlib.sha256(data).hexdigest(),
+                         "2569ede16dfd9078272684d5c42cc2a24353cd6250e4862493886c8881e630f8")
+
+    def test_comparison_records_omit_only_uncompared_writes(self):
+        source = self.root / "capture.cpp"
+        source.write_text('''extern int callee(int);
+void capture(unsigned long *p, int mode) {
+  *p = 123;
+  if (mode == 0) *(volatile int *)0 = 1;
+  if (mode == 1) for (int i=0; i<4097; i++) callee(i);
+  if (mode == 2) asm volatile("mov $0x7f800000, %%eax; movd %%eax, %%xmm0; "
+                             "mov $0x3f800000, %%eax; movd %%eax, %%xmm1; "
+                             "1: subss %%xmm1, %%xmm0; ucomiss %%xmm1, %%xmm0; ja 1b"
+                             ::: "eax", "xmm0", "xmm1", "cc");
+}
+''')
+        obj = self.root / "capture.o"
+        run(["g++", "-O2", "-fno-pic", "-c", str(source), "-o", str(obj)])
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_CACHE_HOME": directory}):
+            out = Path(directory)
+            symbol = "_Z7capturePmi"
+            elf, entry, slot, _, _ = oracle.link(h, "capture", obj, symbol, out)
+            plan = oracle.execution_plan(h, elf, entry, symbol, {symbol}, out)
+            full = oracle.execute_range(h, elf, entry, slot, "pi", 200, plan=plan)
+            compact = oracle.execute_range(h, elf, entry, slot, "pi", 200, plan=plan, keep_writes=False)
+            self.assertEqual({r["outcome"] for r in full}, {"return", "crash", "too-many-calls", "timeout"})
+            for a, b in zip(full, compact):
+                self.assertTrue(a["writes"])
+                self.assertEqual(b["writes"], a["writes"] if a["outcome"] == "return" else [])
+                self.assertEqual(a["calls"], b["calls"])
+                self.assertFalse(oracle.case_differences(a, b, [], [], h.names, {}, {}, "none"))
+            # Cache entries keep diagnostic writes separate from comparison-only records.
+            with patch.object(oracle, "execute_range", wraps=oracle.execute_range) as execute:
+                a = oracle.cached_run(h, elf, entry, slot, "pi", 200, plan=plan)
+                b = oracle.cached_run(h, elf, entry, slot, "pi", 200, plan=plan, keep_writes=False)
+                self.assertEqual(execute.call_count, 2)
+                self.assertEqual([r["writes"] for r in a], [r["writes"] for r in full])
+                self.assertEqual([r["writes"] for r in b], [r["writes"] for r in compact])
+
+    def test_page_budget_retries_one_sided_exhaustion_and_keys_cache(self):
+        source = self.root / "pages.cpp"
+        source.write_text('''extern "C" int pages() {
+  volatile unsigned long *p = (volatile unsigned long *)0x100000000000UL;
+  for (int i=0; i<16; i++) p[i*512] = i;
+  return 7;
+}
+''')
+        obj = self.root / "pages.o"
+        run(["g++", "-O2", "-fno-pic", "-c", str(source), "-o", str(obj)])
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_CACHE_HOME": directory}):
+            out = Path(directory)
+            elf, entry, slot, _, _ = oracle.link(h, "pages", obj, "pages", out)
+            plan = oracle.execution_plan(h, elf, entry, "pages", {"pages"}, out)
+            with patch.dict(os.environ, {"ORACLE_PAGE_BUDGET": "4"}):
+                limited = oracle.cached_run(h, elf, entry, slot, "", 1, plan=plan)
+            complete = oracle.cached_run(h, elf, entry, slot, "", 1, plan=plan)
+            self.assertEqual(limited[0]["outcome"], "timeout")
+            self.assertEqual(limited[0]["timeout_reason"], "page-budget")
+            self.assertEqual(limited[0]["pages"], 4)
+            self.assertEqual(limited[0]["execution_limit"]["pages"], 4)
+            self.assertEqual(complete[0]["outcome"], "return")
+            self.assertEqual(complete[0]["pages"], 16)
+            # A finite candidate exceeding the initial budget gets its full verdict.
+            quick_source = self.root / "quick.cpp"
+            quick_source.write_text('extern "C" int pages() { return 7; }')
+            quick = self.root / "quick.o"
+            run(["g++", "-O2", "-fno-pic", "-c", str(quick_source), "-o", str(quick)])
+            with patch.dict(os.environ, {"ORACLE_PAGE_BUDGET": "4"}):
+                report = oracle.check(h, "pages", {"slow": obj, "quick": quick, "third": quick},
+                                      cases=1, returns="int", static=True, arguments="", out=out / "kept")
+            self.assertEqual(report["budget_retries"]["slow vs quick"], [1])
+            self.assertEqual(report["outcomes"]["slow"], {"return": 1})
+            # Different writes in the returning candidate remain a difference after confirmation.
+            self.assertEqual(report["comparison"]["slow vs quick"]["differ"], 1)
+            for name in ("slow", "quick", "third"):
+                record = json.loads((out / "kept" / (name + ".jsonl")).read_text())
+                self.assertGreater(record["execution_limit"]["pages"], 4)
+            self.assertTrue(oracle.budget_mismatch(limited[0], complete[0]))
+            self.assertFalse(oracle.budget_mismatch(limited[0], limited[0]))
+
+    def test_indirect_read_of_existing_page_does_not_exhaust_page_budget(self):
+        source = self.root / "existing.cpp"
+        source.write_text('''extern int callee(int);
+extern "C" int existing() {
+  volatile unsigned long *p = (volatile unsigned long *)0x100000000000UL;
+  *p = (unsigned long)&callee;
+  return ((int (*)(int))*p)(42);
+}
+''')
+        obj = self.root / "existing.o"
+        run(["g++", "-O2", "-fno-pic", "-c", str(source), "-o", str(obj)])
+        h = oracle.Harvest(self.root, "test")
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            elf, entry, slot, _, _ = oracle.link(h, "existing", obj, "existing", out)
+            plan = oracle.execution_plan(h, elf, entry, "existing", {"existing"}, out)
+            [record] = oracle.execute_range(h, elf, entry, slot, "", 1, plan=plan, pages=1)
+            self.assertEqual(record["outcome"], "return")
+            self.assertEqual(record["pages"], 1)
+            self.assertEqual(len(record["calls"]), 1)
 
     def test_verdict_comparison_stops_after_an_outcome_difference(self):
         class Unreadable:
