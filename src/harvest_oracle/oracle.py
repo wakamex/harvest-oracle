@@ -26,6 +26,8 @@ from pathlib import Path
 from .records import PackedCalls, decode_records, read_records, record_json
 
 BASE = 0x20000000
+STACK_BASE = 0x30000000
+STACK_SIZE = 0x100000
 # A version given as this path runs the original executable's own code of the function in place.
 IMAGE = "image"
 ALLOCATORS = frozenset(("_Znwm", "_Znam", "malloc", "calloc", "realloc"))
@@ -615,6 +617,38 @@ def normalized_writes(writes, ranges):
     return result
 
 
+def difference_channel(difference):
+    """The first observable category and position named by a case difference."""
+    fields = difference.split()
+    if fields[0] == "call":
+        index = int(fields[1].rstrip(":"))
+        if fields[1].endswith(":"):
+            return "call-target", index
+        if "float" in fields and "registers" in fields:
+            return "call-float-registers", index
+        if "float" in fields and "args" in fields:
+            return "call-float-args", index
+        if "args" in fields:
+            return "call-args", index
+        return "call", index
+    if fields[0] == "crash":
+        return "crash-page",
+    if fields[0] == "writes":
+        return "writes",
+    if fields[0] == "outcome":
+        return "outcome",
+    if fields[0] == "return":
+        return "return",
+    if len(fields) > 1 and fields[1] == "calls":
+        return "call-count",
+    return fields[0],
+
+
+def same_difference_channel(first, second):
+    """Whether two cases first differ in the same observable category and position."""
+    return difference_channel(first) == difference_channel(second)
+
+
 # ucontext register numbers of the general-purpose registers, by 64-bit and 32-bit name.
 UCONTEXT_REGISTERS = {"r8": 0, "r9": 1, "r10": 2, "r11": 3, "r12": 4, "r13": 5, "r14": 6, "r15": 7, "rdi": 8,
                       "rsi": 9, "rbp": 10, "rbx": 11, "rdx": 12, "rax": 13, "rcx": 14, "rsp": 15}
@@ -1193,8 +1227,12 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
                     result.append("local:")
                 else:
                     if data:
+                        size = sizes[k] if k < len(sizes) else 8
+                        if (count is None and STACK_BASE <= value
+                                and value + 32 <= STACK_BASE + STACK_SIZE):
+                            size = 16
                         result.append("local:" + normalized_writes([["0x0", data]], ranges)[0][1][:
-                                          2 * (sizes[k] if k < len(sizes) else 8)])
+                                          2 * size])
                     else:
                         result.append(hex(moved))
             return result
@@ -1218,9 +1256,11 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
     if (len(a["calls"]) != len(b["calls"]) and not diffs
             and not a["outcome"] == b["outcome"] == "timeout"):
         diffs.append(f"{len(a['calls'])} calls vs {len(b['calls'])}")
-    # A case that stops on a fault compares its calls and fault address but not its writes, since which
-    # stores precede a faulting load depends on instruction scheduling.
-    if (a["outcome"] == b["outcome"] == "return" and a["writes"] != b["writes"]
+    # Matching crash pages and call traces leave the final writes as an observable difference; a different
+    # fault page or call trace can reflect which faulting access instruction scheduling reached first.
+    compare_crash_writes = a["outcome"] == b["outcome"] == "crash" and not diffs
+    if ((a["outcome"] == b["outcome"] == "return" or compare_crash_writes)
+            and a["writes"] != b["writes"]
             and normalized_writes(a["writes"], ranges_a) != normalized_writes(b["writes"], ranges_b)):
         diffs.append(f"writes differ ({len(a['writes'])} runs vs {len(b['writes'])})")
     return diffs
@@ -1336,14 +1376,20 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         # A case in which any version reads past a static table it indexes is undefined: what lies past the
         # table depends on each build's data layout.
         undefined = {i for rs in results.values() for i, r in enumerate(rs) if r["outcome"] == "undefined"}
-        differing = {other: [i for i, (a, b) in enumerate(zip(results[reference], results[other]))
-                             if i not in undefined and differs(a, b, ranges[reference], ranges[other],
-                                                               setups[reference], setups[other], first_only=True)]
-                     for other in others}
-        # Layout check: a differing case that some version answers differently once its own data moves depends
-        # on that layout (an out-of-range index into a static table, a value derived from an address), not on
-        # what the code does, and is reported apart from the differences.
-        layout_dependent = set()
+        differing, first_differences = {}, {}
+        for other in others:
+            differing[other], first_differences[other] = [], {}
+            for i, (a, b) in enumerate(zip(results[reference], results[other])):
+                if i in undefined:
+                    continue
+                found = differs(a, b, ranges[reference], ranges[other], setups[reference], setups[other],
+                                first_only=True)
+                if found:
+                    differing[other].append(i)
+                    first_differences[other][i] = found[0]
+        # A case is layout-dependent when moving a version's own data changes the same first observation that
+        # differs between versions. An unrelated write change must not hide a call-argument difference.
+        layout_dependent = {other: set() for other in others}
         suspects = sorted({i for indices in differing.values() for i in indices})
         for name, (padded, obj) in runners.items() if suspects else ():
             elf, entry, slot, _, padded_ranges = link(harvest, name, obj, function, padded, pad=True)
@@ -1361,11 +1407,15 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                                 budget=instruction_budget() * (RETRY_MULTIPLIER if enlarged else 1),
                                 keep_writes=bool(out), pages=MAX_PAGES if enlarged else page_budget())
                 for i, again in zip(indices, moved):
-                    if differs(results[name][i], again, ranges[name], padded_ranges, first_only=True):
-                        layout_dependent.add(i)
+                    self_difference = differs(results[name][i], again, ranges[name], padded_ranges, first_only=True)
+                    if self_difference:
+                        for compared in others:
+                            if (i in first_differences[compared] and (name == reference or name == compared)
+                                    and same_difference_channel(first_differences[compared][i], self_difference[0])):
+                                layout_dependent[compared].add(i)
     comparison = {}
     for other in others:
-        real = [i for i in differing[other] if i not in layout_dependent]
+        real = [i for i in differing[other] if i not in layout_dependent[other]]
         examples = [{"seed": results[reference][i]["seed"],
                      "differences": differs(results[reference][i], results[other][i], ranges[reference],
                                             ranges[other], setups[reference], setups[other])} for i in real[:5]]

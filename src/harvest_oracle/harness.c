@@ -982,8 +982,9 @@ static void finish(const char *outcome, uint64_t detail, const struct result *re
   line_limit -= skipped;
   int first = 1;
   static unsigned char before[PAGE];
-  // Only returning cases compare writes. Diagnostic exports retain every outcome's writes.
-  if (!compare_only || result) {
+  // Comparison records retain returning writes and matching-crash candidates. The oracle filters crashes
+  // to matching fault pages and call traces before comparing their writes.
+  if (!compare_only || result || strcmp(outcome, "crash") == 0) {
     for (int i = 0; i < page_count; i++) {
       fill(pages[i], before);
       n = writes(line, n, pages[i], (unsigned char *)pages[i], before, PAGE, &first);

@@ -225,6 +225,7 @@ int operator[](int);
 
     def test_run_cache_uses_execution_inputs_and_file_contents(self):
         h = oracle.Harvest(self.root, "test")
+        default_budget = oracle.instruction_budget()
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_CACHE_HOME": directory}):
             out = Path(directory)
             elf, entry, slot, _, _ = oracle.link(h, "cached", self.objects["o2"], UPDATE, out)
@@ -256,7 +257,7 @@ int operator[](int);
                 with patch.dict(os.environ, {"ORACLE_INSTRUCTION_BUDGET": "0"}):
                     fallback = oracle.cached_run(h, copy, entry, slot, "pf", 11, plan=plan)
                 self.assertEqual(fallback[0]["execution_limit"]["mode"], "wall-clock")
-                self.assertEqual(execute.call_count, 6)
+                self.assertEqual(execute.call_count, 4 + len({100_000_000, 0} - {default_budget}))
 
     def test_call_storage_uses_file_mappings_instead_of_whole_run_copies(self):
         import mmap
@@ -381,7 +382,7 @@ void capture(unsigned long *p, int mode) {
             self.assertEqual({r["outcome"] for r in full}, {"return", "crash", "too-many-calls", "timeout"})
             for a, b in zip(full, compact):
                 self.assertTrue(a["writes"])
-                self.assertEqual(b["writes"], a["writes"] if a["outcome"] == "return" else [])
+                self.assertEqual(b["writes"], a["writes"] if a["outcome"] in {"return", "crash"} else [])
                 self.assertEqual(a["calls"], b["calls"])
                 self.assertFalse(oracle.case_differences(a, b, [], [], h.names, {}, {}, "none"))
             # Cache entries keep diagnostic writes separate from comparison-only records.
@@ -464,6 +465,47 @@ extern "C" int existing() {
         b = {"outcome": "crash", "detail": "0x0", "writes": [], "calls": Unreadable()}
         self.assertEqual(oracle.case_differences(a, b, [], [], {}, {}, {}, "none", first_only=True),
                          ["outcome return vs crash"])
+
+    def test_matching_crashes_compare_generated_writes(self):
+        a = {"outcome": "crash", "detail": "0x1000", "calls": [],
+             "writes": [["0x100000000000", "0000000000000000"]]}
+        b = {**a, "writes": [["0x100000000000", "0000000000000001"]]}
+        self.assertEqual(oracle.case_differences(a, b, [], [], {}, {}, {}, "none"),
+                         ["writes differ (1 runs vs 1)"])
+        other_page = {**b, "detail": "0x2000"}
+        self.assertEqual(oracle.case_differences(a, other_page, [], [], {}, {}, {}, "none"),
+                         ["crash at 0x1000 vs 0x2000"])
+        different_call = {**b, "calls": [{"to": "0x600000", "gp": [oracle.POISON] * 6,
+                                           "deref": [""] * 6, "xmm": [oracle.POISON] * 8}]}
+        original_call = {**a, "calls": [{"to": "0x500000", "gp": [oracle.POISON] * 6,
+                                          "deref": [""] * 6, "xmm": [oracle.POISON] * 8}]}
+        self.assertEqual(oracle.case_differences(original_call, different_call, [], [], {}, {}, {}, "none"),
+                         ["call 0: 0x500000 vs 0x600000"])
+
+    def test_unknown_call_compares_sixteen_byte_stack_objects(self):
+        before = bytes(32)
+        after = bytearray(before)
+        after[12] = 1
+
+        def record(pointer, data):
+            call = {"to": "0x500000", "gp": [oracle.POISON, hex(pointer)] + [oracle.POISON] * 4,
+                    "xmm": [oracle.POISON] * 8, "deref": ["", data.hex()] + [""] * 4}
+            return {"outcome": "return", "rax": "0x0", "writes": [], "calls": [call]}
+
+        stack_pointer = 0x300FFF40
+        stack_difference = oracle.case_differences(record(stack_pointer, before),
+                                                   record(stack_pointer, bytes(after)), [], [], {}, {}, {}, "none")
+        self.assertTrue(stack_difference)
+        other_pointer_difference = oracle.case_differences(record(0x400000, before),
+                                                           record(0x400000, bytes(after)), [], [], {}, {}, {}, "none")
+        self.assertEqual(other_pointer_difference, [])
+
+    def test_layout_confirmation_matches_the_first_difference_channel(self):
+        call_difference = "call 33 0x500000 args ['local:old'] vs ['local:new']"
+        self.assertFalse(oracle.same_difference_channel(call_difference, "writes differ (4 runs vs 4)"))
+        self.assertTrue(oracle.same_difference_channel(call_difference, "call 33 0x500000 args ['x'] vs ['y']"))
+        self.assertFalse(oracle.same_difference_channel(call_difference, "call 34 0x500000 args ['x'] vs ['y']"))
+        self.assertTrue(oracle.same_difference_channel("writes differ (4 runs vs 4)", "writes differ (8 runs vs 8)"))
 
     def test_workers_leave_a_gibibyte_of_available_memory_each(self):
         meminfo = "MemTotal: 33554432 kB\nMemAvailable: 3145728 kB\n"

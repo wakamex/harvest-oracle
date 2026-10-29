@@ -22,6 +22,10 @@ BSP = "daisy/scene/CBspTree.cpp"
 SPLITTER = "_ZN5daisy5scene8CBspTree12findSplitterEPNS1_7BspPolyEjRN2ox4core8CPlane3dIfEE"
 DROP = "HarvestFull/harvest/entity/CDropshipEntity.cpp"
 UPDATE = "_ZN7harvest6entity15CDropshipEntity11updateLogicEf"
+BUTTON = "daisy/gui/CGUIButton.cpp"
+BUTTON_DRAW = "_ZN5daisy3gui10CGUIButton4drawEv"
+HIGHSCORE = "HarvestFull/harvest/gui/CHighscoreScreen.cpp"
+HIGHSCORE_VISIBLE = "_ZN7harvest3gui16CHighscoreScreen10setVisibleEb"
 LOAD = "_ZN5daisy5video14CSpritePackage4loadEPN2ox2io9IReadFileEPKc"
 
 # Each replacement must occur exactly once in the recovered translation unit. The expected behavior
@@ -89,6 +93,26 @@ MUTATIONS = [
      'unsigned int frontCount = 0;\n\t\tunsigned int backCount = 0;', 'unsigned int backCount = 0;\n\t\tunsigned int frontCount = 0;'),
     ('drop-increment', DROP, UPDATE, 'int', False, True,
      '++LaughIndex;', 'LaughIndex += 1;'),
+    ("button-relative-rect-local-copy", BUTTON, BUTTON_DRAW, "none", False, False,
+     "    if (RelativeSizeChanged && States[EBS_NORMAL])\n"
+     "    {\n"
+     "        core::CDimension2d<int> size = States[EBS_NORMAL]->getFrameSize(0);\n"
+     "        RelativeRect.LowerRightCorner.X = RelativeRect.UpperLeftCorner.X + size.Width;\n"
+     "        RelativeRect.LowerRightCorner.Y = RelativeRect.UpperLeftCorner.Y + size.Height;\n"
+     "        updateAbsolutePosition();\n"
+     "    }",
+     "    if (RelativeSizeChanged && States[EBS_NORMAL])\n"
+     "    {\n"
+     "        core::CDimension2d<int> size = States[EBS_NORMAL]->getFrameSize(0);\n"
+     "        core::CPosition2d<int> lowerRightCorner = RelativeRect.LowerRightCorner;\n"
+     "        lowerRightCorner.X = RelativeRect.UpperLeftCorner.X + size.Width;\n"
+     "        lowerRightCorner.Y = RelativeRect.UpperLeftCorner.Y + size.Height;\n"
+     "        updateAbsolutePosition();\n"
+     "    }"),
+    ("highscore-summary-local-copy", HIGHSCORE, HIGHSCORE_VISIBLE, "none", False, False,
+     "            summaryArea.LowerRightCorner.Y = summaryTop + SpriteSizes[SPRITE_ALL_BACKGROUND].Height;",
+     "            ox::core::CPosition2d<int> lowerRightCorner = summaryArea.LowerRightCorner;\n"
+     "            lowerRightCorner.Y = summaryTop + SpriteSizes[SPRITE_ALL_BACKGROUND].Height;"),
 ]
 
 
