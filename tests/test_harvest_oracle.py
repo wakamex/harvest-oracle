@@ -117,6 +117,27 @@ class SyntheticCheckout(unittest.TestCase):
         self.assertEqual(pair["differ"], 0)
         self.assertEqual(pair["agree"] + pair["undefined"], 200)
 
+    def check_lua_string(self, api, prototype, args):
+        objects = {}
+        for name, suffix in (("a", "x"), ("b", "y")):
+            path = self.root / f"{api}-{name}.cpp"
+            path.write_text(f'''extern "C" void {api}({prototype});\n'''
+                            f'''static const char text[] = {{'a', 'b', 'c', 0, '{suffix}'}};\n'''
+                            f'''void api_case() {{ {api}(0, {args}); }}\n''')
+            obj = self.root / f"{api}-{name}.o"
+            run(["g++", "-O1", "-fno-pic", "-c", "-o", str(obj), str(path)])
+            objects[name] = obj
+        report = oracle.check(oracle.Harvest(self.root, "test"), "_Z8api_casev", objects, cases=20,
+                              returns="none", static=True)
+        return report["comparison"]["a vs b"]
+
+    def test_lua_cstring_stops_at_its_terminator(self):
+        self.assertEqual(self.check_lua_string("lua_pushstring", "void *, const char *", "text")["differ"], 0)
+
+    def test_lua_counted_string_compares_its_length(self):
+        self.assertEqual(self.check_lua_string("lua_pushlstring", "void *, const char *, unsigned long",
+                                               "text, 3")["differ"], 0)
+
     def test_accesses_name_struct_fields_by_argument(self):
         harvest = oracle.Harvest(self.root, "test")
         start, size = harvest.known[UPDATE], harvest.sizes[UPDATE]
@@ -283,6 +304,71 @@ extern "C" void _start() { for (;;) {} }
 
 
 class Helpers(unittest.TestCase):
+    def test_indexed_table_guard_tracks_a_computed_base_and_skips_stores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "indexed.s"
+            source.write_text("""
+.section .rodata
+.local factors
+.type factors,@object
+.size factors,12
+factors:
+  .long 1,2,3
+.text
+.globl read_index
+.type read_index,@function
+read_index:
+  lea factors(%rip), %rax
+  mov (%rax,%rdi,4), %eax
+  ret
+.globl write_index
+.type write_index,@function
+write_index:
+  lea factors(%rip), %rax
+  mov %esi, (%rax,%rdi,4)
+  ret
+.globl add_index
+.type add_index,@function
+add_index:
+  lea factors(%rip), %rax
+  add %esi, (%rax,%rdi,4)
+  ret
+.globl read_scalar
+.type read_scalar,@function
+read_scalar:
+  lea factors(%rip), %rax
+  mov (%rax), %eax
+  ret
+.globl read_offset
+.type read_offset,@function
+read_offset:
+  mov %rdi, %rax
+  add $factors, %rax
+  mov (%rax), %eax
+  ret
+.globl read_spill
+.type read_spill,@function
+read_spill:
+  mov %rdi, %rax
+  add $factors, %rax
+  mov %rax, 8(%rsp)
+  mov 8(%rsp), %rdx
+  mov (%rdx), %eax
+  ret
+.globl _start
+_start:
+  ret
+""")
+            obj = root / "indexed.o"
+            elf = root / "indexed"
+            run(["gcc", "-c", "-o", str(obj), str(source)])
+            run(["gcc", "-nostdlib", "-no-pie", "-Wl,-Ttext=0x400000", "-o", str(elf), str(obj)])
+            guard_rows = [entry.split(":") for entry in oracle.guards(elf).split(",") if entry]
+            self.assertEqual(len(guard_rows), 3)
+            factor = next(line.split() for line in run(["nm", "-S", str(elf)]).splitlines() if line.endswith(" factors"))
+            self.assertEqual(int(guard_rows[0][2], 16), int(factor[0], 16))
+
     def test_parameters_split_at_top_level(self):
         self.assertEqual(oracle.parameters("f(int, ox::core::CRect<float> const&, a<b, c>)"),
                          ["int", "ox::core::CRect<float> const&", "a<b, c>"])

@@ -340,9 +340,9 @@ static void emulate_call(ucontext_t *uc, uint64_t target) {
   }
 }
 
-// Indexed reads of a version's own sized data, from ORACLE_GUARDS: each guarded instruction starts with int3,
-// and a read outside the indexed symbol's extent ends the case as undefined, since what lies past a static
-// table depends on each build's data layout. An in-bounds read runs the original instruction by single step.
+// Indexed reads and reads through a computed table base, from ORACLE_GUARDS: each guarded instruction starts
+// with int3, and a read outside the read-only symbol's extent ends the case as undefined, since what lies past
+// static data depends on each build's layout. An in-bounds read runs the original instruction by single step.
 struct guard {
   uint64_t insn, disp, start, end;
   int base, index, scale, wide;  // ucontext register numbers, -1 for none; wide: 64-bit registers
@@ -371,7 +371,8 @@ static int guard_trap(ucontext_t *uc) {
     struct guard *q = &guards[i];
     if ((uint64_t)g[REG_RIP] - 1 != q->insn)
       continue;
-    uint64_t index = g[q->index], base = q->base >= 0 ? (uint64_t)g[q->base] : 0;
+    uint64_t index = q->index >= 0 ? (uint64_t)g[q->index] : 0;
+    uint64_t base = q->base >= 0 ? (uint64_t)g[q->base] : 0;
     if (!q->wide)
       index &= 0xffffffff, base &= 0xffffffff;
     uint64_t address = q->disp + base + index * q->scale;

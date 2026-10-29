@@ -43,10 +43,67 @@ POINTEE_SIZES = {
     "double": 8, "bool": 1, "char": 1, "wchar_t": 4, "unsigned char": 1,
 }
 
-# Integer argument counts of C library callees, which have no mangled signature.
-C_ARGUMENTS = {"wcscmp": 2, "strcmp": 2, "strlen": 1, "wcslen": 1, "memcpy": 3, "memmove": 3, "memset": 3,
-               "malloc": 1, "free": 1, "calloc": 2, "realloc": 2, "_Unwind_Resume": 1, "__cxa_begin_catch": 1,
-               "__cxa_end_catch": 0, "__cxa_rethrow": 0, "__cxa_atexit": 3, "__cxa_pure_virtual": 0}
+# Integer argument counts of C callees, which have no mangled signature.
+C_ARGUMENTS = {
+    "wcscmp": 2, "wcslen": 1, "wcsncmp": 3, "strcmp": 2, "strncmp": 3, "strcoll": 2,
+    "strcspn": 2, "strspn": 2, "strlen": 1, "strnlen": 2, "strchr": 2, "strrchr": 2,
+    "strpbrk": 2, "strstr": 2, "strtok": 2, "strcpy": 2, "strncpy": 3, "strcat": 2,
+    "strncat": 3, "strdup": 1, "strndup": 2, "strtol": 3, "strtoul": 3, "strtoll": 3,
+    "strtoull": 3, "strtod": 2, "strtof": 2, "lua_pushstring": 2, "lua_pushlstring": 3,
+    "lua_pushvfstring": 3, "lua_pushfstring": 2, "lua_getfield": 3, "lua_setfield": 3,
+    "lua_getglobal": 2, "lua_setglobal": 2, "luaL_getmetafield": 3, "luaL_callmeta": 3,
+    "luaL_typerror": 3, "luaL_argerror": 3, "luaL_checkstack": 3, "luaL_newmetatable": 2,
+    "luaL_checkudata": 3, "luaL_error": 2, "luaL_loadfile": 2, "luaL_loadstring": 2,
+    "luaL_loadbuffer": 4, "luaL_loadbufferx": 4, "luaL_register": 3, "luaL_gsub": 4,
+    "luaL_optlstring": 4,
+    "memcpy": 3, "memmove": 3, "memset": 3, "malloc": 1, "free": 1, "calloc": 2, "realloc": 2,
+    "_Unwind_Resume": 1, "__cxa_begin_catch": 1, "__cxa_end_catch": 0, "__cxa_rethrow": 0,
+    "__cxa_atexit": 3, "__cxa_pure_virtual": 0,
+}
+
+# Readable string parameters by general-purpose argument register. A cstring descriptor includes its NUL
+# terminator; a counted descriptor names the register holding its length and the bytes per element.
+C_STRING_ARGUMENTS = {
+    "wcscmp": {0: ("cstring", 4), 1: ("cstring", 4)},
+    "wcslen": {0: ("cstring", 4)},
+    "wcsncmp": {0: ("bounded", 2, 4), 1: ("bounded", 2, 4)},
+    "strcmp": {0: ("cstring", 1), 1: ("cstring", 1)},
+    "strncmp": {0: ("bounded", 2, 1), 1: ("bounded", 2, 1)},
+    "strcoll": {0: ("cstring", 1), 1: ("cstring", 1)},
+    "strcspn": {0: ("cstring", 1), 1: ("cstring", 1)},
+    "strspn": {0: ("cstring", 1), 1: ("cstring", 1)},
+    "strlen": {0: ("cstring", 1)},
+    "strnlen": {0: ("bounded", 1, 1)},
+    "strchr": {0: ("cstring", 1)},
+    "strrchr": {0: ("cstring", 1)},
+    "strpbrk": {0: ("cstring", 1), 1: ("cstring", 1)},
+    "strstr": {0: ("cstring", 1), 1: ("cstring", 1)},
+    "strtok": {0: ("cstring", 1), 1: ("cstring", 1)},
+    "strcpy": {1: ("cstring", 1)},
+    "strncpy": {1: ("bounded", 2, 1)},
+    "strcat": {0: ("cstring", 1), 1: ("cstring", 1)},
+    "strncat": {0: ("cstring", 1), 1: ("bounded", 2, 1)},
+    "strdup": {0: ("cstring", 1)},
+    "strndup": {0: ("bounded", 1, 1)},
+    "strtol": {0: ("cstring", 1)}, "strtoul": {0: ("cstring", 1)},
+    "strtoll": {0: ("cstring", 1)}, "strtoull": {0: ("cstring", 1)},
+    "strtod": {0: ("cstring", 1)}, "strtof": {0: ("cstring", 1)},
+    "lua_pushstring": {1: ("cstring", 1)},
+    "lua_pushlstring": {1: ("counted", 2, 1)},
+    "lua_pushvfstring": {1: ("cstring", 1)}, "lua_pushfstring": {1: ("cstring", 1)},
+    "lua_getfield": {2: ("cstring", 1)}, "lua_setfield": {2: ("cstring", 1)},
+    "lua_getglobal": {1: ("cstring", 1)}, "lua_setglobal": {1: ("cstring", 1)},
+    "luaL_getmetafield": {2: ("cstring", 1)}, "luaL_callmeta": {2: ("cstring", 1)},
+    "luaL_typerror": {2: ("cstring", 1)}, "luaL_argerror": {2: ("cstring", 1)},
+    "luaL_checkstack": {2: ("cstring", 1)}, "luaL_newmetatable": {1: ("cstring", 1)},
+    "luaL_checkudata": {2: ("cstring", 1)}, "luaL_error": {1: ("cstring", 1)},
+    "luaL_loadfile": {1: ("cstring", 1)}, "luaL_loadstring": {1: ("cstring", 1)},
+    "luaL_loadbuffer": {1: ("counted", 2, 1), 3: ("cstring", 1)},
+    "luaL_loadbufferx": {1: ("counted", 2, 1), 3: ("cstring", 1)},
+    "luaL_register": {1: ("cstring", 1)},
+    "luaL_gsub": {1: ("cstring", 1), 2: ("cstring", 1), 3: ("cstring", 1)},
+    "luaL_optlstring": {2: ("cstring", 1)},
+}
 
 
 def run(command, **kwargs):
@@ -303,11 +360,13 @@ def pointee_size(parameter):
     return POINTEE_SIZES.get(base, 8)
 
 
-def describe_callees(callees, signatures, pointee):
+def describe_callees(callees, signatures, pointee, string_arguments=None):
     """Argument register counts (integer, float) and pointee sizes of callees, from their mangled names."""
     for name, demangled in zip(callees, demangle(callees)):
         if name in C_ARGUMENTS:
             signatures[name] = (C_ARGUMENTS[name], 0)
+            if string_arguments is not None and name in C_STRING_ARGUMENTS:
+                string_arguments[name] = C_STRING_ARGUMENTS[name]
             continue
         if "(" not in demangled or ")" not in demangled:
             continue
@@ -443,33 +502,233 @@ UCONTEXT_REGISTERS.update({"e" + n[1:] if n[0] == "r" and n[1:].isalpha() else n
                            for n, v in list(UCONTEXT_REGISTERS.items())})
 
 
+def instruction_parts(text):
+    """Return the mnemonic and AT&T operands from one objdump instruction line."""
+    text = text.split("#", 1)[0].strip()
+    match = re.match(r"([a-z][a-z0-9]*)(?:\s+(.*))?", text)
+    return (match.group(1), match.group(2) or "") if match else ("", "")
+
+
 def guards(elf, function=None):
-    """Indexed reads of the version's own sized data in FUNCTION: instructions addressing disp(base,index,scale)
-    whose displacement falls inside a sized data symbol, with that symbol's extent."""
+    """Reads of sized read-only data reached through indexed or short register and stack address sequences."""
     symbols = []
     for line in run(["nm", "-S", str(elf)]).splitlines():
         parts = line.split()
-        if len(parts) == 4 and parts[2] in "rRdDbB":
+        if len(parts) == 4 and parts[2] in "rR" and int(parts[1], 16):
             symbols.append((int(parts[0], 16), int(parts[0], 16) + int(parts[1], 16)))
     listing = run(["objdump", "-d", "--no-show-raw-insn", str(elf)])
     body = (listing.split(f"<{function}>:\n", 1)[1].split("\n\n", 1)[0] if function else listing).splitlines()
-    instructions = [(int(m.group(1), 16), m.group(2)) for m in
-                    (re.match(r"\s*([0-9a-f]+):\s+(.*)", line) for line in body) if m]
+    instructions, entries = [], set()
+    for line in body:
+        label = re.match(r"\s*([0-9a-f]+)\s+<[^>]+>:", line)
+        if label:
+            entries.add(int(label.group(1), 16))
+        instruction = re.match(r"\s*([0-9a-f]+):\s+(.*)", line)
+        if instruction:
+            instructions.append((int(instruction.group(1), 16), instruction.group(2)))
+    targets = set()
+    for _, text in instructions:
+        mnemonic, operands = instruction_parts(text)
+        if mnemonic.startswith("j"):
+            target = re.match(r"\s*(0x[0-9a-f]+)", operands)
+            if target:
+                targets.add(int(target.group(1), 16))
+
+    aliases = {}
+    for names in (("rax", "eax", "ax", "al"), ("rbx", "ebx", "bx", "bl"),
+                  ("rcx", "ecx", "cx", "cl"), ("rdx", "edx", "dx", "dl"),
+                  ("rsi", "esi", "si", "sil"), ("rdi", "edi", "di", "dil"),
+                  ("rbp", "ebp", "bp", "bpl"), ("rsp", "esp", "sp", "spl"),
+                  *((f"r{i}", f"r{i}d", f"r{i}w", f"r{i}b") for i in range(8, 16))):
+        aliases.update((name, names[0]) for name in names)
+
+    def register(operand):
+        match = re.fullmatch(r"%([a-z0-9]+)", operand.strip())
+        return aliases.get(match.group(1)) if match else None
+
+    def extent_at(address):
+        return next(((start, end) for start, end in symbols if start <= address < end), None)
+
+    def split_operands(operands):
+        result, start, depth = [], 0, 0
+        for i, char in enumerate(operands):
+            depth += (char == "(") - (char == ")")
+            if char == "," and depth == 0:
+                result.append(operands[start:i].strip())
+                start = i + 1
+        if operands.strip():
+            result.append(operands[start:].strip())
+        return result
+
+    def reads_memory(mnemonic, operands, address_operand):
+        if mnemonic == "lea" or mnemonic.startswith(("prefetch", "nop")):
+            return False
+        if address_operand < len(operands) - 1:
+            return True
+        if mnemonic.startswith(("cmpxchg", "bts", "btr", "btc")):
+            return False
+        return mnemonic.startswith(("cmp", "test", "bt", "push", "call", "jmp", "fld", "fild", "fcom",
+                                    "ficom", "fucom", "fcomp", "ficomp"))
+
     result = []
+    bases = {}
+    stack_bases = {}
+
+    def stack_slot(operand):
+        match = re.fullmatch(r"(-?0x[0-9a-f]+)?\(%(rsp|rbp)\)", operand.strip())
+        if not match:
+            return None
+        return aliases[match.group(2)], int(match.group(1) or "0", 16)
+
+    def fact_extent(fact, displacement=0):
+        if fact and (fact[3] or fact[0] <= fact[2] + displacement < fact[1]):
+            return fact[:2]
+        return None
+
+    def address_fact(start, end, offset, dynamic=False):
+        return start, end, offset, dynamic
+
     for (address, text), (following, _) in zip(instructions, instructions[1:] + [(None, None)]):
-        if text.startswith(("call", "jmp")):
-            continue
-        m = re.search(r"(-?0x[0-9a-f]+)\((?:%(\w+))?,%(\w+),([1248])\)", text)
-        if not m:
-            continue
-        displacement = int(m.group(1), 16) & 0xFFFFFFFFFFFFFFFF
-        extent = next(((a, b) for a, b in symbols if a <= displacement < b), None)
-        if not extent or m.group(3) not in UCONTEXT_REGISTERS:
-            continue
-        base = UCONTEXT_REGISTERS.get(m.group(2), -1) if m.group(2) else -1
-        wide = int(m.group(3).startswith("r"))
-        result.append(f"{address:x}:{displacement:x}:{extent[0]:x}:{extent[1]:x}:{base}:"
-                      f"{UCONTEXT_REGISTERS[m.group(3)]}:{m.group(4)}:{wide}")
+        if address in entries:
+            bases.clear()
+            stack_bases.clear()
+        elif address in targets:
+            bases.clear()
+        mnemonic, operand_text = instruction_parts(text)
+        operands = split_operands(operand_text)
+        following_address = following if following is not None else address
+        length = following_address - address
+
+        indexed = None
+        simple = None
+        memory_operand = -1
+        for i, operand in enumerate(operands):
+            indexed = re.fullmatch(r"(-?0x[0-9a-f]+)?\((?:%([a-z0-9]+))?,%([a-z0-9]+),([1248])\)", operand)
+            if indexed:
+                memory_operand = i
+                break
+        if indexed is None:
+            for i, operand in enumerate(operands):
+                simple = re.fullmatch(r"(-?0x[0-9a-f]+)?\(%([a-z0-9]+)\)", operand)
+                if simple:
+                    memory_operand = i
+                    break
+        if memory_operand >= 0 and reads_memory(mnemonic, operands, memory_operand):
+            if indexed:
+                displacement = int(indexed.group(1) or "0", 16)
+                base_name, index_name = indexed.group(2), indexed.group(3)
+                extent = extent_at(displacement)
+                if extent is None and base_name:
+                    extent = fact_extent(bases.get(aliases.get(base_name)), displacement)
+                if extent and index_name in UCONTEXT_REGISTERS:
+                    base = UCONTEXT_REGISTERS.get(base_name, -1) if base_name else -1
+                    wide = int((base_name or "").startswith("r") or index_name.startswith("r"))
+                    result.append(f"{address:x}:{displacement & 0xffffffffffffffff:x}:{extent[0]:x}:{extent[1]:x}:"
+                                  f"{base}:{UCONTEXT_REGISTERS[index_name]}:{indexed.group(4)}:{wide}")
+            elif simple:
+                displacement = int(simple.group(1) or "0", 16)
+                base_name = simple.group(2)
+                fact = bases.get(aliases.get(base_name))
+                if fact and fact[3]:
+                    extent = fact[:2]
+                    base = UCONTEXT_REGISTERS[base_name]
+                    result.append(f"{address:x}:{displacement & 0xffffffffffffffff:x}:{extent[0]:x}:{extent[1]:x}:"
+                                  f"{base}:-1:0:1")
+
+        destination = register(operands[-1]) if operands else None
+        source_register = register(operands[0]) if operands else None
+        immediate = re.fullmatch(r"\$(-?(?:0x[0-9a-f]+|[0-9]+))", operands[0]) if operands else None
+        source_slot = stack_slot(operands[0]) if operands else None
+        destination_slot = stack_slot(operands[-1]) if operands else None
+
+        if mnemonic == "lea" and destination:
+            source = operands[0]
+            rip = re.fullmatch(r"(-?0x[0-9a-f]+)?\(%rip\)", source)
+            address_operand = re.fullmatch(r"(-?0x[0-9a-f]+)?\((?:%([a-z0-9]+))?(?:,%([a-z0-9]+),([1248]))?\)",
+                                           source)
+            if rip:
+                target = address + length + int(rip.group(1) or "0", 16)
+                extent = extent_at(target)
+                if extent:
+                    bases[destination] = address_fact(*extent, target)
+                else:
+                    bases.pop(destination, None)
+            elif address_operand:
+                displacement = int(address_operand.group(1) or "0", 16)
+                base_name, index_name = address_operand.group(2), address_operand.group(3)
+                if base_name and aliases.get(base_name) in bases:
+                    fact = bases[aliases[base_name]]
+                    bases[destination] = address_fact(*fact[:2], fact[2] + displacement,
+                                                      fact[3] or bool(index_name))
+                elif not base_name and extent_at(displacement):
+                    extent = extent_at(displacement)
+                    bases[destination] = address_fact(*extent, displacement, bool(index_name))
+                else:
+                    bases.pop(destination, None)
+            else:
+                bases.pop(destination, None)
+        elif mnemonic.startswith("mov") and destination:
+            if source_register in bases:
+                bases[destination] = bases[source_register]
+            elif source_slot in stack_bases:
+                bases[destination] = stack_bases[source_slot]
+            elif immediate:
+                target = int(immediate.group(1), 0)
+                extent = extent_at(target)
+                if extent:
+                    bases[destination] = address_fact(*extent, target)
+                else:
+                    bases.pop(destination, None)
+            else:
+                bases.pop(destination, None)
+        elif mnemonic.startswith(("add", "sub")) and destination:
+            if immediate:
+                amount = int(immediate.group(1), 0)
+                if mnemonic.startswith("sub"):
+                    amount = -amount
+                if destination in bases:
+                    fact = bases[destination]
+                    offset = fact[2] if fact[3] else fact[2] + amount
+                    bases[destination] = address_fact(*fact[:2], offset, fact[3])
+                elif extent_at(amount):
+                    extent = extent_at(amount)
+                    bases[destination] = address_fact(*extent, amount, True)
+                else:
+                    bases.pop(destination, None)
+            else:
+                fact = bases.get(destination) or bases.get(source_register)
+                if fact:
+                    bases[destination] = address_fact(*fact[:2], fact[2], True)
+                else:
+                    bases.pop(destination, None)
+        elif mnemonic.startswith("mov") and destination_slot:
+            if source_register in bases:
+                stack_bases[destination_slot] = bases[source_register]
+            else:
+                stack_bases.pop(destination_slot, None)
+        elif mnemonic.startswith(("add", "sub")) and destination_slot:
+            if destination_slot in stack_bases:
+                fact = stack_bases[destination_slot]
+                stack_bases[destination_slot] = address_fact(*fact[:2], fact[2], True)
+        else:
+            if destination and mnemonic not in {"cmp", "test", "bt", "push", "call", "jmp", "ret", "nop"}:
+                if mnemonic.startswith(("shl", "sal", "shr", "sar", "inc", "dec", "neg")) and destination in bases:
+                    fact = bases[destination]
+                    bases[destination] = address_fact(*fact[:2], fact[2], True)
+                else:
+                    bases.pop(destination, None)
+            if mnemonic.startswith("xchg"):
+                for operand in operands:
+                    source = register(operand)
+                    if source:
+                        bases.pop(source, None)
+            if mnemonic.startswith("call"):
+                for name in ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"):
+                    bases.pop(name, None)
+            elif mnemonic.startswith(("jmp", "ret")):
+                bases.clear()
+        if destination == "rsp" or mnemonic.startswith(("push", "pop")):
+            stack_bases.clear()
     return ",".join(result)
 
 
@@ -580,7 +839,7 @@ def call_identity(call, names, ranges=()):
 
 
 def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, return_kind, setups_a=None,
-                     setups_b=None):
+                     setups_b=None, string_arguments=None):
     """How case A and case B differ, as a list of short descriptions; empty when they agree."""
     diffs = []
     if a["outcome"] != b["outcome"]:
@@ -615,6 +874,27 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
                 diffs.append(f"call {i} {ix} float registers {fa} vs {fb}")
                 break
         sizes = pointee.get(ix, [])
+        string_sizes = (string_arguments or {}).get(ix, {})
+
+        def string_size(call, k, data):
+            descriptor = string_sizes[k]
+            raw = bytes.fromhex(data)
+            if descriptor[0] == "cstring":
+                width = descriptor[1]
+                end = next((i for i in range(0, len(raw) - width + 1, width)
+                            if raw[i : i + width] == bytes(width)), len(raw))
+                return min(len(raw), end + width) if end < len(raw) else len(raw)
+            if descriptor[0] == "counted":
+                length = int(call["gp"][descriptor[1]], 16) * descriptor[2]
+                return min(len(raw), length)
+            if descriptor[0] == "bounded":
+                length = min(len(raw), int(call["gp"][descriptor[1]], 16) * descriptor[2])
+                raw = raw[:length]
+                width = descriptor[2]
+                end = next((i for i in range(0, len(raw) - width + 1, width)
+                            if raw[i : i + width] == bytes(width)), len(raw))
+                return min(len(raw), end + width) if end < len(raw) else len(raw)
+            raise ValueError(f"unknown string argument descriptor {descriptor}")
 
         def shown(call, ranges):
             result = []
@@ -624,9 +904,19 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
                 # Code pointers keep address identity; data pointees still compare their contents.
                 canonical = any(image <= moved < image + size and names.get(image) in signatures
                                 for _, size, image in ranges_a + ranges_b)
-                result.append(hex(moved) if canonical or not data else
-                              "local:" + normalized_writes([["0x0", data]], ranges)[0][1][:
-                                  2 * (sizes[k] if k < len(sizes) else 8)])
+                if canonical or (not data and k not in string_sizes):
+                    result.append(hex(moved))
+                elif k in string_sizes and data:
+                    result.append("local:" + data[: 2 * string_size(call, k, data)])
+                elif k in string_sizes and string_sizes[k][0] in ("counted", "bounded") and not int(
+                        call["gp"][string_sizes[k][1]], 16):
+                    result.append("local:")
+                else:
+                    if data:
+                        result.append("local:" + normalized_writes([["0x0", data]], ranges)[0][1][:
+                                          2 * (sizes[k] if k < len(sizes) else 8)])
+                    else:
+                        result.append(hex(moved))
             return result
 
         # Identical raw arguments, none pointing into translated data, are equal without translating.
@@ -662,9 +952,10 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         raise SystemExit(f"{function} has no mangled parameter list: give its arguments")
     spec = arguments if arguments is not None else argument_spec(signature, member=not static)
     return_kind = harvest.return_kind(signature) if returns == "auto" and "(" in signature else returns
-    signatures, pointee = {}, {}
-    describe_callees(list(harvest.known), signatures, pointee)
-    describe_callees([entry.split("=", 1)[1] for entry in harvest.plt.split(",") if "=" in entry], signatures, pointee)
+    signatures, pointee, string_arguments = {}, {}, {}
+    describe_callees(list(harvest.known), signatures, pointee, string_arguments)
+    describe_callees([entry.split("=", 1)[1] for entry in harvest.plt.split(",") if "=" in entry], signatures,
+                     pointee, string_arguments)
     follow = harvest.vague_functions | {function}
     for obj in versions.values():
         if str(obj) != IMAGE:
@@ -694,12 +985,13 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                 padded.mkdir(exist_ok=True)
                 runners[name] = (padded, Path(obj))
             stub_lists[name] = stubs
-            describe_callees(stubs, signatures, pointee)
+            describe_callees(stubs, signatures, pointee, string_arguments)
             if out:
                 (directory / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results[name]))
 
         def differs(a, b, ra, rb, sa=None, sb=None):
-            return case_differences(a, b, ra, rb, harvest.names, signatures, pointee, return_kind, sa, sb)
+            return case_differences(a, b, ra, rb, harvest.names, signatures, pointee, return_kind, sa, sb,
+                                    string_arguments)
 
         reference, *others = list(results)
         # A case in which any version reads past a static table it indexes is undefined: what lies past the
