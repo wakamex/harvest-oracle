@@ -1160,12 +1160,20 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc != 7)
-    return fprintf(stderr, "usage: harness IMAGE VARIANT ENTRY ARGSPEC SEED COUNT\n"), 2;
+    return fprintf(stderr, "usage: harness IMAGE VARIANT ENTRY ARGSPEC SEED|- COUNT\n"), 2;
   uint64_t entry = strtoull(argv[3], NULL, 0);
   binary_records = getenv("ORACLE_BINARY") != NULL;
   compare_only = getenv("ORACLE_COMPARE_ONLY") != NULL;
   const char *spec = argv[4];
   uint64_t first = strtoull(argv[5], NULL, 0), count = strtoull(argv[6], NULL, 0);
+  uint64_t *selected = NULL;
+  if (strcmp(argv[5], "-") == 0) {
+    if (count > SIZE_MAX / sizeof(*selected) || !(selected = malloc(count * sizeof(*selected))))
+      return fprintf(stderr, "invalid seed count\n"), 2;
+    for (uint64_t i = 0; i < count; i++)
+      if (scanf("%lu", &selected[i]) != 1)
+        return fprintf(stderr, "missing seed\n"), 2;
+  }
   seed = 0;  // the image's generated .bss contents use seed 0, the same for every case and variant
   if (!map_elf(argv[1], image, &image_count, 1, &image_text_start, &image_text_end) ||
       (strcmp(argv[2], "-") != 0 && !map_elf(argv[2], variant, &variant_count, 0, NULL, NULL)))
@@ -1241,7 +1249,8 @@ int main(int argc, char **argv) {
   // A case is the only writer until waitpid completes, so regular files need no parent relay.
   struct stat output_stat;
   int direct_output = fstat(STDOUT_FILENO, &output_stat) == 0 && S_ISREG(output_stat.st_mode);
-  for (uint64_t s = first; s < first + count; s++) {
+  for (uint64_t i = 0; i < count; i++) {
+    uint64_t s = selected ? selected[i] : first + i;
     int fds[2];
     if (!direct_output && pipe(fds) < 0)
       return perror("record pipe"), 3;

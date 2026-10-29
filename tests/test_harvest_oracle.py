@@ -192,6 +192,37 @@ int operator[](int);
             self.assertEqual([r["seed"] for r in parallel], list(range(8, 19)))
             self.assertEqual(serial, parallel)
 
+    def test_sparse_seed_workers_batch_ordered_lists(self):
+        h = oracle.Harvest(self.root, "test")
+        seeds = [19, 2, 33, 2, 8, 60, 1, 99, 4, 5, 20]
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            elf, entry, slot, _, _ = oracle.link(h, "sparse", self.objects["o2"], UPDATE, out)
+            plan = oracle.execution_plan(h, elf, entry, UPDATE, {UPDATE}, out)
+            with patch.dict(os.environ, {"ORACLE_WORKERS": "1"}):
+                serial = [oracle.execute_range(h, elf, entry, slot, "pf", 1, first=seed, plan=plan)[0]
+                          for seed in seeds]
+            actual_run = subprocess.run
+            with patch.object(oracle, "execution_workers", return_value=3), patch.object(
+                    oracle.subprocess, "run", wraps=actual_run) as calls:
+                parallel = oracle.execute(h, elf, entry, slot, "pf", None, seeds=seeds, plan=plan)
+            launches = [c for c in calls.call_args_list if len(c.args[0]) == 7]
+            self.assertEqual(len(launches), 3)
+            self.assertEqual([r["seed"] for r in parallel], seeds)
+            self.assertEqual(serial, parallel)
+            with patch.object(oracle.subprocess, "run", side_effect=AssertionError("launched empty seed list")):
+                self.assertEqual(oracle.execute(h, elf, entry, slot, "pf", None, seeds=[], plan=plan), [])
+
+    def test_layout_confirmation_batches_each_version(self):
+        actual = oracle.execute
+        with patch.object(oracle, "execute", wraps=actual) as execute:
+            report = oracle.check(oracle.Harvest(self.root, "test"), UPDATE,
+                                  {"a": self.objects["o2"], "b": self.objects["nan"]},
+                                  cases=80, returns="int", static=True)
+        self.assertGreater(report["comparison"]["a vs b"]["differ"], 0)
+        self.assertEqual(execute.call_count, 2)
+        self.assertTrue(all(len(c.kwargs["seeds"]) > 1 for c in execute.call_args_list))
+
     def test_run_cache_uses_execution_inputs_and_file_contents(self):
         h = oracle.Harvest(self.root, "test")
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_CACHE_HOME": directory}):
@@ -992,6 +1023,35 @@ loop_counter: .long 0
         # Overlapping aliases retain the first range's translation.
         aliases = oracle.AddressRanges([(16, 16, 100), (8, 16, 200)])
         self.assertEqual(oracle.translate(17, aliases), 101)
+
+    def test_native_capture_scan_checks_every_field_and_translation_bounds(self):
+        from harvest_oracle.records import CALL, PackedCalls
+        row = [0x500000, 0, *range(2, 18), bytes(range(192))]
+        left = PackedCalls(CALL.pack(*row) * 4, [])
+        for column in range(42):
+            data = bytearray(left.data)
+            data[CALL.size * 2 + column * 8] ^= 1
+            right = PackedCalls(data, [])
+            self.assertEqual(left.equal_capture_prefix(right), column == 17, column)
+        for column in (0, 2, 3, 4, 5, 6, 7):
+            self.assertFalse(left.equal_capture_prefix(left, row[column], row[column] + 1), column)
+        self.assertTrue(left.equal_capture_prefix(left, 0x600000, 0x700000))
+        self.assertFalse(left.equal_capture_prefix(PackedCalls(left.data, ["other"])))
+        # The sufficient native check handles address rejection without a Python pass over each word.
+        with patch.object(PackedCalls, "addresses", side_effect=AssertionError("rescanned addresses")):
+            record = {"outcome": "timeout", "detail": "0x0", "writes": [], "calls": left}
+            self.assertEqual(oracle.case_differences(record, record, [], [], {}, {}, {}, "none"), [])
+
+    def test_native_target_runs_preserve_the_complete_identity_sequence(self):
+        from harvest_oracle.records import CALL, PackedCalls
+        def call(target, name=0):
+            return CALL.pack(target, name, *([0] * 16), bytes(192))
+        calls = PackedCalls(call(100) * 23 + call(200, 1) * 7 + call(300) + call(100) * 9, ["callee"])
+        expected = oracle.call_identities(list(calls), {100: "first", 300: "last"}, [])
+        with patch.object(PackedCalls, "targets", side_effect=AssertionError("decoded every target")):
+            self.assertEqual(oracle.call_identities(calls, {100: "first", 300: "last"}, []), expected)
+        self.assertEqual(list(calls.target_runs()), [(100, 0, 23), (200, 1, 7), (300, 0, 1), (100, 0, 9)])
+        self.assertEqual(list(PackedCalls(b"", []).target_runs()), [])
 
     def test_packed_name_validation_avoids_per_call_unpacking(self):
         from harvest_oracle import records

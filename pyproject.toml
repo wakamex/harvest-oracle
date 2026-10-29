@@ -16,4 +16,4 @@ requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-source-include = ["src/harvest_oracle/harness.c", "src/harvest_oracle/functions.tsv"]
+source-include = ["src/harvest_oracle/harness.c", "src/harvest_oracle/packed.c", "src/harvest_oracle/functions.tsv"]

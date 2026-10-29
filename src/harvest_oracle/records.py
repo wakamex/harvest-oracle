@@ -1,9 +1,16 @@
 """Lazy call traces from the harness's versioned binary frames."""
 
+import ctypes
+import functools
+import hashlib
 import json
 import mmap
 import os
 import struct
+import subprocess
+import tempfile
+from importlib import resources
+from pathlib import Path
 from collections.abc import Sequence
 
 
@@ -11,6 +18,30 @@ HEADER = struct.Struct("<4Q")
 CALL = struct.Struct("<18Q192s")
 TARGET = struct.Struct("<QQ320x")
 MAGIC = int.from_bytes(b"ORCALL01", "little")
+
+
+@functools.lru_cache(maxsize=1)
+def packed_library():
+    """Build the fixed-width scans with the same compiler required by the execution harness."""
+    source = resources.files("harvest_oracle").joinpath("packed.c").read_bytes()
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle"
+    library = cache / f"packed-{hashlib.sha256(source).hexdigest()[:16]}.so"
+    if not library.exists():
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as scratch:
+            c, so = Path(scratch) / "packed.c", Path(scratch) / "packed.so"
+            c.write_bytes(source)
+            subprocess.run(["gcc", "-O2", "-shared", "-fPIC", "-o", str(so), str(c)], check=True,
+                           capture_output=True)
+            so.replace(library)
+    lib = ctypes.CDLL(str(library))
+    lib.capture_equal.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint64, ctypes.c_uint64]
+    lib.capture_equal.restype = ctypes.c_int
+    lib.valid_names.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint64]
+    lib.valid_names.restype = ctypes.c_int
+    lib.target_runs.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64)]
+    lib.target_runs.restype = ctypes.c_size_t
+    return lib
 
 
 class PackedCalls(Sequence):
@@ -27,14 +58,26 @@ class PackedCalls(Sequence):
     def targets(self):
         return TARGET.iter_unpack(self.data)
 
-    def equal_capture_prefix(self, other):
-        """Sufficient raw equality of every captured field except the instruction's return site."""
+    def equal_capture_prefix(self, other, lower=0, upper=0):
+        """Sufficient equality except return sites, rejecting possible translated addresses.
+
+        Copies are bounded by one case's two call traces, rather than the complete mapped run.
+        """
         if self.names != other.names:
             return False
-        size = min(len(self.data), len(other.data))
-        a, b = self.data[:size].cast("Q"), other.data[:size].cast("Q")
-        stride = CALL.size // 8
-        return all(a[column::stride] == b[column::stride] for column in range(stride) if column != 17)
+        count = min(len(self), len(other))
+        size = count * CALL.size
+        return bool(packed_library().capture_equal(self.data[:size].tobytes(), other.data[:size].tobytes(),
+                                                  count, lower, upper))
+
+    def target_runs(self):
+        lengths = (ctypes.c_uint64 * len(self))()
+        count = packed_library().target_runs(self.data.tobytes(), len(self), lengths)
+        offset = 0
+        for length in lengths[:count]:
+            target, name = TARGET.unpack_from(self.data, offset * CALL.size)
+            yield target, name, length
+            offset += length
 
     def addresses(self, count):
         """Distinct targets and integer arguments of a prefix, for translation checks."""
@@ -91,7 +134,7 @@ def decode_records(data):
             length, = struct.unpack("<Q", take(8))
             names.append(take(length).tobytes().decode())
         # Validate name indices even when no consumer materializes the calls.
-        if max(calls.cast("Q")[1::CALL.size // 8], default=0) > name_count:
+        if not packed_library().valid_names(calls.tobytes(), count, name_count):
             raise ValueError("invalid oracle call name")
         record["calls"] = PackedCalls(calls, names)
         result.append(record)

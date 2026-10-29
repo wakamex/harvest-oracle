@@ -865,12 +865,8 @@ def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_
             keep_writes=True, pages=None):
     """Run the harness on seeds 1 to CASES, or on SEEDS. ELF is a linked version, or "-" with
     OWN = (start, size) to run the executable's own code of the function in place."""
-    if seeds is not None:
-        return [r for seed in seeds
-                for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed, guard_list=guard_list,
-                                       plan=plan, budget=budget, keep_writes=keep_writes, pages=pages)]
     return execute_range(harvest, elf, entry, slot, spec, cases, own, guard_list=guard_list, plan=plan, budget=budget,
-                         keep_writes=keep_writes, pages=pages)
+                         keep_writes=keep_writes, pages=pages, seeds=seeds)
 
 
 # Measured peak per worker on CSpritePackage::load and IGUIStaticText::breakText: 6.45 GiB across eight
@@ -886,7 +882,12 @@ def execution_workers():
 
 
 def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list="", plan=None, binary=True,
-                  output=None, budget=None, keep_writes=True, pages=None):
+                  output=None, budget=None, keep_writes=True, pages=None, seeds=None):
+    if seeds is not None:
+        seeds = list(seeds)
+        cases = len(seeds)
+    if not cases:
+        return []
     thunk, native = slot if isinstance(slot, tuple) else (slot, None)
     env = {"ORACLE_THUNK_SLOT": f"0x{thunk:x}"} if thunk else {}
     env["ORACLE_INSTRUCTION_BUDGET"] = str(instruction_budget() if budget is None else budget)
@@ -919,7 +920,8 @@ def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, gua
         command = [str(harness_binary()), str(harvest.image), str(elf), f"0x{entry:x}", spec]
         workers = min(execution_workers(), cases)
         if workers <= 1:
-            subprocess.run([*command, str(first), str(cases)], check=True, stdout=output,
+            subprocess.run([*command, "-" if seeds is not None else str(first), str(cases)], check=True, stdout=output,
+                           input="".join(f"{s}\n" for s in seeds).encode() if seeds is not None else None,
                            stderr=subprocess.PIPE, env=env)
         else:
             cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle"
@@ -930,12 +932,15 @@ def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, gua
                 jobs = []
                 for i, stream in enumerate(streams):
                     start = first + i * width + min(i, extra)
-                    jobs.append((stream, start, width + (i < extra)))
+                    count = width + (i < extra)
+                    selected = seeds[start - first:start - first + count] if seeds is not None else None
+                    jobs.append((stream, start, count, selected))
 
                 def run_shard(job):
-                    stream, start, count = job
-                    subprocess.run([*command, str(start), str(count)], check=True, stdout=stream,
-                                   stderr=subprocess.PIPE, env=env)
+                    stream, start, count, selected = job
+                    subprocess.run([*command, "-" if selected is not None else str(start), str(count)],
+                                   input="".join(f"{s}\n" for s in selected).encode() if selected is not None else None,
+                                   check=True, stdout=stream, stderr=subprocess.PIPE, env=env)
 
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     list(pool.map(run_shard, jobs))
@@ -1068,12 +1073,12 @@ def call_identities(calls, names, ranges):
         return tuple(call_identity(c, names, ranges) for c in calls)
     identities = {}
     result = []
-    for target, name in calls.targets():
+    for target, name, count in calls.target_runs():
         key = target, name
         if key not in identities:
             identities[key] = (calls.names[name - 1].split("@")[0] if name else
                                call_identity({"to": hex(target)}, names, ranges))
-        result.append(identities[key])
+        result.extend([identities[key]] * count)
     return tuple(result)
 
 
@@ -1086,13 +1091,11 @@ def call_pairs(a, b, ranges_a, ranges_b, names, signatures):
     if not isinstance(a, PackedCalls) or not isinstance(b, PackedCalls):
         yield from zip(a, b)
         return
-    if a.equal_capture_prefix(b):
-        bounds = [r if isinstance(r, AddressRanges) else AddressRanges(r) for r in (ranges_a, ranges_b) if r]
-        lower = min((r.lower for r in bounds), default=0)
-        upper = max((r.upper for r in bounds), default=0)
-        if not any(lower <= value < upper and inside_ranges(value, ranges_a, ranges_b)
-                   for value in a.addresses(min(len(a), len(b)))):
-            return
+    bounds = [r if isinstance(r, AddressRanges) else AddressRanges(r) for r in (ranges_a, ranges_b) if r]
+    lower = min((r.lower for r in bounds), default=0)
+    upper = max((r.upper for r in bounds), default=0)
+    if a.equal_capture_prefix(b, lower, upper):
+        return
     rules = {}
     for i, (x, y) in enumerate(zip(a.rows(), b.rows())):
         key = x[:2], y[:2]
@@ -1347,14 +1350,19 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
             plan = execution_plan(harvest, elf, entry, function, follow, padded)
             apply_guidance(plan, guidance)
             padded_guards = guards(elf)
-            moved = (record for i in suspects
-                     for record in execute(harvest, elf, entry, slot, spec, None, plan=plan, seeds=[i + 1],
-                                           guard_list=padded_guards, budget=instruction_budget() *
-                                           (RETRY_MULTIPLIER if i in retry_indices else 1), keep_writes=bool(out),
-                                           pages=MAX_PAGES if i in retry_indices else page_budget()))
-            for i, again in zip(suspects, moved):
-                if differs(results[name][i], again, ranges[name], padded_ranges, first_only=True):
-                    layout_dependent.add(i)
+            # Keep the original allowance of each seed, including confirmed budget retries.
+            retried = set(retry_indices)
+            for enlarged in (False, True):
+                indices = [i for i in suspects if (i in retried) == enlarged]
+                if not indices:
+                    continue
+                moved = execute(harvest, elf, entry, slot, spec, None, plan=plan, seeds=[i + 1 for i in indices],
+                                guard_list=padded_guards,
+                                budget=instruction_budget() * (RETRY_MULTIPLIER if enlarged else 1),
+                                keep_writes=bool(out), pages=MAX_PAGES if enlarged else page_budget())
+                for i, again in zip(indices, moved):
+                    if differs(results[name][i], again, ranges[name], padded_ranges, first_only=True):
+                        layout_dependent.add(i)
     comparison = {}
     for other in others:
         real = [i for i in differing[other] if i not in layout_dependent]
