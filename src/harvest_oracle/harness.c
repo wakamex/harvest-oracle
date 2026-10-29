@@ -18,6 +18,10 @@
 // return registers, the calls in order and every byte written to the region or to the image.
 #define _GNU_SOURCE
 #include <elf.h>
+#include <errno.h>
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
@@ -80,6 +84,40 @@ static int call_count;
 static uint64_t return_counter;
 static int out_fd;
 static int binary_records;
+static int instruction_fd = -1, instruction_error;
+static uint64_t instruction_budget = 1000000000;
+static int measure_instructions;
+static const char *timeout_reason = "loop-proof";
+
+static int open_counter(int sampling) {
+  if (!instruction_budget)
+    return instruction_error = ECANCELED, -1;
+  struct perf_event_attr attr = {
+    .size = sizeof(attr), .type = PERF_TYPE_HARDWARE, .config = PERF_COUNT_HW_INSTRUCTIONS,
+    .disabled = 1, .pinned = 1, .exclude_kernel = 1, .exclude_hv = 1,
+    .sample_period = sampling ? instruction_budget : 0, .sigtrap = sampling, .remove_on_exec = 1,
+  };
+  int fd = syscall(SYS_perf_event_open, &attr, 0, -1, -1, PERF_FLAG_FD_CLOEXEC);
+  if (fd < 0)
+    instruction_error = errno;
+  return fd;
+}
+
+static void start_counter(int sampling) {
+  instruction_fd = open_counter(sampling);
+  if (instruction_fd < 0)
+    return;
+  uint64_t count;
+  // A pinned event that cannot be scheduled reads EOF. Do not silently use an idle counter.
+  if (ioctl(instruction_fd, PERF_EVENT_IOC_ENABLE, 0) < 0)
+    instruction_error = errno;
+  else if (read(instruction_fd, &count, sizeof(count)) != sizeof(count) || !count)
+    instruction_error = EBUSY;
+  else
+    return;
+  close(instruction_fd);
+  instruction_fd = -1;
+}
 
 // splitmix64
 static uint64_t mix(uint64_t x) {
@@ -610,8 +648,14 @@ static void handler(int signal, siginfo_t *info, void *context) {
   ucontext_t *uc = context;
   greg_t *g = uc->uc_mcontext.gregs;
   uint64_t rip = g[REG_RIP], fault = (uint64_t)info->si_addr;
-  if (signal == SIGALRM)
+  if (signal == SIGALRM) {
+    timeout_reason = "wall-clock";
     finish("timeout", rip, NULL);
+  }
+  if (signal == SIGTRAP && info->si_code == TRAP_PERF && instruction_fd >= 0) {
+    timeout_reason = "instruction-budget";
+    finish("timeout", rip, NULL);
+  }
   if (signal == SIGTRAP && (guard_trap(uc) || loop_trap(uc) || branch_trap(uc)))
     return;
   // A call or jump out of the image function under test lands on the int3 filling the rest of its pages.
@@ -636,8 +680,9 @@ static void handler(int signal, siginfo_t *info, void *context) {
   finish(signal == SIGFPE ? "fpe" : signal == SIGILL ? "ill" : signal == SIGBUS ? "bus" : "signal", rip, NULL);
 }
 
-static char line[1 << 22];
-static size_t line_limit = sizeof(line);
+// Leave room for limit diagnostics without charging them to the existing trace budget.
+static char line[(1 << 22) + 256];
+static size_t line_limit = 1 << 22;
 
 // Binary frames contain metadata JSON, fixed-size calls, then length-prefixed names. The unused rax
 // field carries the dereference mask; name pointers become one-based indices.
@@ -699,10 +744,16 @@ static size_t writes(char *to, size_t used, uint64_t start, const unsigned char 
 }
 
 static void finish(const char *outcome, uint64_t detail, const struct result *result) {
+  uint64_t instructions = 0;
+  if (instruction_fd >= 0) {
+    ioctl(instruction_fd, PERF_EVENT_IOC_DISABLE, 0);
+    read(instruction_fd, &instructions, sizeof(instructions));
+  }
   // The execution outcome is settled. Output backpressure must not start a second, partial record.
   sigset_t blocked;
   sigemptyset(&blocked);
   sigaddset(&blocked, SIGALRM);
+  sigaddset(&blocked, SIGTRAP);
   sigprocmask(SIG_BLOCK, &blocked, NULL);
   alarm(0);
   size_t n = sprintf(line, "{\"seed\":%lu,\"outcome\":\"%s\",\"detail\":\"0x%lx\"", seed, outcome, detail);
@@ -711,7 +762,7 @@ static void finish(const char *outcome, uint64_t detail, const struct result *re
                  result->rdx, result->xmm0, result->xmm1);
   n += sprintf(line + n, ",\"calls\":[");
   size_t skipped = 0, wire_count = 0;
-  for (int i = 0; i < call_count && n + skipped < sizeof(line) - 1024; i++) {
+  for (int i = 0; i < call_count && n + skipped < line_limit - 1024; i++) {
     struct call *c = &calls[i];
     if (binary_records) {
       uint64_t mask = 0;
@@ -762,7 +813,14 @@ static void finish(const char *outcome, uint64_t detail, const struct result *re
     if (image[i].writable)
       n = writes(line, n, image[i].start, (unsigned char *)image[i].start, image[i].pristine, image[i].end - image[i].start,
                  &first);
-  n += sprintf(line + n, "],\"pages\":%d}\n", page_count);
+  n += sprintf(line + n, "],\"pages\":%d", page_count);
+  n += sprintf(line + n, ",\"execution_limit\":{\"mode\":\"%s\",\"budget\":%lu,\"error\":%d}",
+               instruction_fd >= 0 ? "instructions" : "wall-clock", instruction_budget, instruction_error);
+  if (measure_instructions)
+    n += sprintf(line + n, ",\"instructions\":%lu", instructions);
+  if (strcmp(outcome, "timeout") == 0)
+    n += sprintf(line + n, ",\"timeout_reason\":\"%s\"", timeout_reason);
+  n += sprintf(line + n, "}\n");
   if (binary_records) {
     uint64_t header[] = {wire_magic, n, wire_count, wire_name_count};
     emit_bytes(header, sizeof(header));
@@ -897,6 +955,15 @@ void oracle_thunk(void);
 void oracle_native(void);
 
 int main(int argc, char **argv) {
+  const char *budget = getenv("ORACLE_INSTRUCTION_BUDGET");
+  if (budget)
+    instruction_budget = strtoull(budget, NULL, 0);
+  measure_instructions = getenv("ORACLE_MEASURE_INSTRUCTIONS") != NULL;
+  if (argc == 2 && strcmp(argv[1], "--probe") == 0) {
+    start_counter(0);
+    printf("%d\n", instruction_error);
+    return 0;
+  }
   if (argc != 7)
     return fprintf(stderr, "usage: harness IMAGE VARIANT ENTRY ARGSPEC SEED COUNT\n"), 2;
   uint64_t entry = strtoull(argv[3], NULL, 0);
@@ -999,6 +1066,7 @@ int main(int argc, char **argv) {
       }
       alarm(2);
       struct result result;
+      start_counter(1);
       oracle_call(entry, &regs, &result);
       alarm(0);
       finish("return", 0, &result);

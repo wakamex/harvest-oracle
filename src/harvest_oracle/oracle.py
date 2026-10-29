@@ -768,19 +768,22 @@ def text_section(image):
     raise SystemExit(f"{image} has no .text section")
 
 
-def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_list="", plan=None):
+def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_list="", plan=None, budget=None):
     """Run the harness on seeds 1 to CASES, or on SEEDS. ELF is a linked version, or "-" with
     OWN = (start, size) to run the executable's own code of the function in place."""
     if seeds is not None:
         return [r for seed in seeds
-                for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed, guard_list=guard_list, plan=plan)]
-    return execute_range(harvest, elf, entry, slot, spec, cases, own, guard_list=guard_list, plan=plan)
+                for r in execute_range(harvest, elf, entry, slot, spec, 1, own, first=seed, guard_list=guard_list, plan=plan, budget=budget)]
+    return execute_range(harvest, elf, entry, slot, spec, cases, own, guard_list=guard_list, plan=plan, budget=budget)
 
 
 def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list="", plan=None, binary=True,
-                  output=None):
+                  output=None, budget=None):
     thunk, native = slot if isinstance(slot, tuple) else (slot, None)
     env = {"ORACLE_THUNK_SLOT": f"0x{thunk:x}"} if thunk else {}
+    env["ORACLE_INSTRUCTION_BUDGET"] = str(instruction_budget() if budget is None else budget)
+    if os.environ.get("ORACLE_MEASURE_INSTRUCTIONS"):
+        env["ORACLE_MEASURE_INSTRUCTIONS"] = "1"
     if binary:
         env["ORACLE_BINARY"] = "1"
     if native:
@@ -848,6 +851,19 @@ def _integer_setups(path, size, mtime, start, end):
     return setups
 
 
+INSTRUCTION_BUDGET = 1_000_000_000
+RETRY_MULTIPLIER = 100
+
+
+def instruction_budget():
+    return int(os.environ.get("ORACLE_INSTRUCTION_BUDGET", INSTRUCTION_BUDGET))
+
+
+def counter_status():
+    return run([str(harness_binary()), "--probe"],
+               env={"ORACLE_INSTRUCTION_BUDGET": str(instruction_budget())}).strip()
+
+
 def cached_image_run(harvest, start, size, spec, cases, plan=None):
     """Keep image execution on the same cache contract as linked object execution."""
     return cached_run(harvest, "-", start, None, spec, cases, own=(start, size), plan=plan)
@@ -862,9 +878,11 @@ def cached_run(harvest, elf, entry, slot, spec, cases, own=None, guard_list="", 
     def digest(path):
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
+    status = counter_status()
     inputs = [digest(harvest.image), digest(elf) if str(elf) != "-" else None, digest(harness_binary()),
               entry, slot, spec, cases, own, guard_list, plan.read_text() if plan else None,
-              harvest.plt, text_section(harvest.image) if plan or own else None]
+              harvest.plt, text_section(harvest.image) if plan or own else None,
+              instruction_budget(), status, bool(os.environ.get("ORACLE_MEASURE_INSTRUCTIONS"))]
     key = hashlib.sha256(json.dumps(inputs).encode()).hexdigest()
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "harvest-oracle" / "runs"
     path = cache / f"{key}.bin"
@@ -877,7 +895,9 @@ def cached_run(harvest, elf, entry, slot, spec, cases, own=None, guard_list="", 
         with temporary.open("w+b") as output:
             result = execute_range(harvest, elf, entry, slot, spec, cases, own=own, guard_list=guard_list, plan=plan,
                                    output=output)
-        temporary.replace(path)
+        # A temporary scheduling failure must not poison a cache keyed by a working probe.
+        if all(str(r.get("execution_limit", {}).get("error", -1)) == status for r in result):
+            temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
     return result
@@ -1037,8 +1057,8 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
             break
     if diffs and first_only:
         return diffs
-    # Both executions reached every completed call in their shared prefix. The longer tail of two
-    # alarm-limited traces reflects elapsed time, so it cannot establish a behavioral difference.
+    # Both executions reached every completed call in their shared prefix. Different machine code
+    # can reach a limit at different call counts, so an unmatched timeout tail cannot establish a difference.
     if (len(a["calls"]) != len(b["calls"]) and not diffs
             and not a["outcome"] == b["outcome"] == "timeout"):
         diffs.append(f"{len(a['calls'])} calls vs {len(b['calls'])}")
@@ -1048,6 +1068,34 @@ def case_differences(a, b, ranges_a, ranges_b, names, signatures, pointee, retur
             and normalized_writes(a["writes"], ranges_a) != normalized_writes(b["writes"], ranges_b)):
         diffs.append(f"writes differ ({len(a['writes'])} runs vs {len(b['writes'])})")
     return diffs
+
+
+def budget_mismatch(a, b):
+    terminal = {"return", "crash", "fpe", "ill", "bus", "signal", "too-many-calls"}
+    return ((a.get("timeout_reason") == "instruction-budget" and b["outcome"] in terminal)
+            or (b.get("timeout_reason") == "instruction-budget" and a["outcome"] in terminal))
+
+
+def execution_limit_summary(results):
+    summary = {}
+    for name, records in results.items():
+        modes = {}
+        for record in records:
+            limit = record.get("execution_limit", {})
+            mode = limit.get("mode", "unknown")
+            modes[mode] = modes.get(mode, 0) + 1
+        errors = sorted({r["execution_limit"]["error"] for r in records
+                         if r.get("execution_limit", {}).get("error")})
+        reasons = {}
+        for record in records:
+            if record["outcome"] == "timeout":
+                reason = record.get("timeout_reason", "unknown")
+                reasons[reason] = reasons.get(reason, 0) + 1
+        summary[name] = {"modes": modes, "fallback_errors": errors, "timeout_reasons": reasons}
+        if errors:
+            summary[name]["note"] = "Instruction counter unavailable; using the two-second wall-clock limit: " + "; ".join(
+                os.strerror(error) for error in errors)
+    return summary
 
 
 def check(harvest, function, versions, cases=400, returns="auto", static=False, arguments=None, out=None):
@@ -1073,7 +1121,7 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
     with tempfile.TemporaryDirectory() as scratch:
         directory = Path(out) if out else Path(scratch)
         directory.mkdir(parents=True, exist_ok=True)
-        results, stub_lists, ranges, runners, setups = {}, {}, {}, {}, {}
+        results, stub_lists, ranges, runners, setups, executions = {}, {}, {}, {}, {}, {}
         for name, obj in versions.items():
             if str(obj) == IMAGE:
                 # The executable's own code of the function, run in place: no object, no delinking.
@@ -1083,11 +1131,13 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                 stubs, ranges[name] = [], []
                 plan = execution_plan(harvest, "-", start, function, follow, directory)
                 results[name] = cached_image_run(harvest, start, size, spec, cases, plan)
+                executions[name] = ("-", start, None, (start, size), "", plan)
                 setups[name] = integer_setups(harvest.image, 0, BASE)
             else:
                 elf, entry, slot, stubs, ranges[name] = link(harvest, name, Path(obj), function, directory)
                 plan = execution_plan(harvest, elf, entry, function, follow, directory)
                 results[name] = cached_run(harvest, elf, entry, slot, spec, cases, guard_list=guards(elf), plan=plan)
+                executions[name] = (elf, entry, slot, None, guards(elf), plan)
                 setups[name] = {**integer_setups(harvest.image, 0, BASE), **integer_setups(elf, BASE, 1 << 64)}
                 # The same version with its own data 4 KB further on, for the layout check.
                 padded = directory / "padded"
@@ -1095,16 +1145,32 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                 runners[name] = (padded, Path(obj))
             stub_lists[name] = stubs
             describe_callees(stubs, signatures, pointee, string_arguments)
-            if out:
-                with (directory / f"{name}.jsonl").open("w") as stream:
-                    for record in results[name]:
-                        stream.write(json.dumps(record, default=record_json) + "\n")
 
         def differs(a, b, ra, rb, sa=None, sb=None, first_only=False):
             return case_differences(a, b, ra, rb, harvest.names, signatures, pointee, return_kind, sa, sb,
                                     string_arguments, first_only)
 
         reference, *others = list(results)
+        # Instruction counts depend on generated code and harness work. Confirm a one-sided
+        # budget exhaustion with a larger allowance before it can establish an outcome difference.
+        budget_retries = {other: sorted(i for i, (a, b) in enumerate(zip(results[reference], results[other]))
+                                        if budget_mismatch(a, b)) for other in others}
+        retry_indices = sorted({i for indices in budget_retries.values() for i in indices})
+        for name in results if retry_indices else ():
+            indices = retry_indices
+            elf, entry, slot, own, guard_list, plan = executions[name]
+            ordered = sorted(indices)
+            again = execute(harvest, elf, entry, slot, spec, None, own=own, guard_list=guard_list,
+                            plan=plan, seeds=[i + 1 for i in ordered],
+                            budget=instruction_budget() * RETRY_MULTIPLIER)
+            for i, record in zip(ordered, again):
+                results[name][i] = record
+        if out:
+            for name, records in results.items():
+                with (directory / f"{name}.jsonl").open("w") as stream:
+                    for record in records:
+                        stream.write(json.dumps(record, default=record_json) + "\n")
+
         # A case in which any version reads past a static table it indexes is undefined: what lies past the
         # table depends on each build's data layout.
         undefined = {i for rs in results.values() for i, r in enumerate(rs) if r["outcome"] == "undefined"}
@@ -1120,8 +1186,10 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
         for name, (padded, obj) in runners.items() if suspects else ():
             elf, entry, slot, _, padded_ranges = link(harvest, name, obj, function, padded, pad=True)
             plan = execution_plan(harvest, elf, entry, function, follow, padded)
-            moved = execute(harvest, elf, entry, slot, spec, None, plan=plan, seeds=[i + 1 for i in suspects],
-                            guard_list=guards(elf))
+            moved = [record for i in suspects
+                     for record in execute(harvest, elf, entry, slot, spec, None, plan=plan, seeds=[i + 1],
+                                           guard_list=guards(elf), budget=instruction_budget() *
+                                           (RETRY_MULTIPLIER if i in retry_indices else 1))]
             for i, again in zip(suspects, moved):
                 if differs(results[name][i], again, ranges[name], padded_ranges, first_only=True):
                     layout_dependent.add(i)
@@ -1143,4 +1211,6 @@ def check(harvest, function, versions, cases=400, returns="auto", static=False, 
                         for r in rs}) for n, rs in results.items()}
     return {"function": function, "signature": signature, "argument_spec": spec, "returns": return_kind,
             "cases": cases, "outcomes": outcomes, "distinct_behaviors": coverage, "named_stubs": stub_lists,
-            "comparison": comparison}
+            "comparison": comparison, "execution_limits": execution_limit_summary(results),
+            "budget_retries": {f"{reference} vs {other}": [i + 1 for i in indices]
+                               for other, indices in budget_retries.items()}}

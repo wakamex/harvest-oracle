@@ -67,7 +67,7 @@ def decode_records(data):
 
     while offset < len(view):
         magic, size, count, name_count = HEADER.unpack(take(HEADER.size))
-        if magic != MAGIC or size > 1 << 22 or count > 4096 or name_count > count:
+        if magic != MAGIC or size > (1 << 22) + 256 or count > 4096 or name_count > count:
             raise ValueError("invalid oracle record header")
         record = json.loads(take(size).tobytes())
         calls = take(count * CALL.size)

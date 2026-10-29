@@ -133,6 +133,14 @@ class SyntheticCheckout(unittest.TestCase):
                 self.assertEqual(execute.call_count, 3)
                 self.assertEqual(len(oracle.cached_run(h, copy, entry, slot, "pf", 11, plan=plan)), 11)
                 self.assertEqual(execute.call_count, 4)
+                with patch.dict(os.environ, {"ORACLE_INSTRUCTION_BUDGET": "100000000"}):
+                    limited = oracle.cached_run(h, copy, entry, slot, "pf", 11, plan=plan)
+                self.assertEqual(limited[0]["execution_limit"]["budget"], 100_000_000)
+                self.assertEqual(execute.call_count, 5)
+                with patch.dict(os.environ, {"ORACLE_INSTRUCTION_BUDGET": "0"}):
+                    fallback = oracle.cached_run(h, copy, entry, slot, "pf", 11, plan=plan)
+                self.assertEqual(fallback[0]["execution_limit"]["mode"], "wall-clock")
+                self.assertEqual(execute.call_count, 6)
 
     def test_call_storage_uses_file_mappings_instead_of_whole_run_copies(self):
         import mmap
@@ -361,6 +369,7 @@ boundary_tail:
         line = json.loads(output)
         self.assertEqual(line["verdict"], "agree")
         self.assertEqual(line["cases"], 50)
+        self.assertIn("execution_limits", line)
 
 
 class FollowedFunctions(unittest.TestCase):
@@ -415,6 +424,107 @@ extern "C" void _start() { for (;;) {} }
     @classmethod
     def tearDownClass(cls):
         cls.scratch.cleanup()
+
+    def budget_object(self, name, body):
+        source = self.root / f"{name}.cpp"
+        source.write_text('extern "C" void budget_work() { ' + body + ' }')
+        obj = source.with_suffix(".o")
+        run(["g++", "-O1", "-fno-pic", "-c", str(source), "-o", str(obj)])
+        return obj
+
+    def budget_run(self, obj, budget, out=None):
+        with patch.dict(os.environ, {"ORACLE_INSTRUCTION_BUDGET": str(budget)}):
+            return oracle.check(oracle.Harvest(self.root, "test"), "budget_work", {"v": obj},
+                                cases=1, returns="none", static=True, arguments="", out=out)
+
+    def require_counter(self):
+        if hasattr(oracle, "counter_status") and oracle.counter_status() != "0":
+            self.skipTest("hardware instruction counter unavailable")
+
+    def test_progressing_loop_uses_instruction_overflow(self):
+        self.require_counter()
+        obj = self.budget_object("progress", 'asm volatile("1: inc %%rax; jmp 1b" ::: "rax");')
+        out = self.root / "progress-records"
+        started = time.monotonic()
+        report = self.budget_run(obj, 1_000_000, out)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(report["outcomes"]["v"], {"timeout": 1})
+        record = json.loads((out / "v.jsonl").read_text())
+        self.assertEqual(record["timeout_reason"], "instruction-budget")
+        self.assertEqual(record["execution_limit"]["mode"], "instructions")
+
+    def test_budget_mismatch_retries_every_version_before_comparison(self):
+        self.require_counter()
+        fast = self.budget_object("fast", "")
+        slow = self.budget_object("slow", 'asm volatile("mov $100000, %%ecx; 1: dec %%ecx; jnz 1b" ::: "ecx");')
+        with patch.dict(os.environ, {"ORACLE_INSTRUCTION_BUDGET": "50000"}):
+            out = self.root / "retry-records"
+            report = oracle.check(oracle.Harvest(self.root, "test"), "budget_work",
+                                  {"fast": fast, "slow": slow, "third": slow}, cases=1,
+                                  returns="none", static=True, arguments="", out=out)
+        self.assertEqual(report["budget_retries"], {"fast vs slow": [1], "fast vs third": [1]})
+        for pair in report["comparison"].values():
+            self.assertEqual(pair["agree"], 1)
+        for name in ("fast", "slow", "third"):
+            record = json.loads((out / f"{name}.jsonl").read_text())
+            self.assertEqual(record["outcome"], "return")
+            self.assertEqual(record["execution_limit"]["budget"], 5_000_000)
+
+    def test_persistent_budget_mismatch_still_reports_difference(self):
+        self.require_counter()
+        fast = self.budget_object("finish", "")
+        slow = self.budget_object("forever", 'asm volatile("1: inc %%rax; jmp 1b" ::: "rax");')
+        with patch.dict(os.environ, {"ORACLE_INSTRUCTION_BUDGET": "50000"}):
+            report = oracle.check(oracle.Harvest(self.root, "test"), "budget_work", {"fast": fast, "slow": slow},
+                                  cases=1, returns="none", static=True, arguments="")
+        pair = report["comparison"]["fast vs slow"]
+        self.assertEqual(report["budget_retries"]["fast vs slow"], [1])
+        self.assertEqual(pair["differ"], 1)
+        self.assertEqual(pair["layout_dependent"], 0)
+
+    def test_counter_unavailable_uses_wall_clock_and_reports_reason(self):
+        # A real kernel filter rejects perf_event_open, as restricted runners do.
+        source = self.root / "deny-perf.c"
+        harness = str(oracle.harness_binary())
+        source.write_text(r"""
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <stddef.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  struct sock_filter filter[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_perf_event_open, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  struct sock_fprog program = {4, filter};
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program)) return 3;
+  execv(HARNESS, argv);
+  return 4;
+}
+""")
+        launcher = source.with_suffix("")
+        run(["gcc", f'-DHARNESS="{harness}"', str(source), "-o", str(launcher)])
+        obj = self.budget_object("fallback", 'asm volatile("1: inc %%rax; jmp 1b" ::: "rax");')
+        out = self.root / "fallback-records"
+        with patch.object(oracle, "harness_binary", return_value=launcher):
+            report = self.budget_run(obj, 1_000_000, out)
+        record = json.loads((out / "v.jsonl").read_text())
+        self.assertEqual(record["timeout_reason"], "wall-clock")
+        self.assertEqual(record["execution_limit"]["error"], 1)
+        self.assertIn("two-second wall-clock", report["execution_limits"]["v"]["note"])
+
+    def test_alarm_is_backstop_when_counter_cannot_see_sleep(self):
+        self.require_counter()
+        obj = self.budget_object("sleeping", 'asm volatile("mov $34, %%eax; syscall" ::: "rax", "rcx", "r11");')
+        out = self.root / "backstop-records"
+        self.budget_run(obj, 1_000_000, out)
+        record = json.loads((out / "v.jsonl").read_text())
+        self.assertEqual(record["execution_limit"]["mode"], "instructions")
+        self.assertEqual(record["timeout_reason"], "wall-clock")
 
     def test_same_unit_helpers_execute_and_preserve_external_boundary(self):
         out = self.root / "records"
@@ -634,6 +744,15 @@ loop_counter: .long 0
         # Overlapping aliases retain the first range's translation.
         aliases = oracle.AddressRanges([(16, 16, 100), (8, 16, 200)])
         self.assertEqual(oracle.translate(17, aliases), 101)
+
+    def test_only_one_sided_budget_exhaustion_requires_confirmation(self):
+        budget = {"outcome": "timeout", "timeout_reason": "instruction-budget"}
+        for outcome in ("return", "crash", "too-many-calls", "fpe", "ill", "bus", "signal"):
+            other = {"outcome": outcome}
+            self.assertTrue(oracle.budget_mismatch(budget, other))
+            self.assertTrue(oracle.budget_mismatch(other, budget))
+        for other in (budget, {"outcome": "undefined"}, {"outcome": "timeout", "timeout_reason": "wall-clock"}):
+            self.assertFalse(oracle.budget_mismatch(budget, other))
 
     def test_timeout_compares_only_completed_common_calls(self):
         call = {"to": "0x400000", "gp": ["0x1"] * 6, "xmm": [oracle.POISON] * 8,

@@ -24,7 +24,8 @@ def cmd_check(args):
             "cases": report["cases"], "agree": pair["agree"], "differ": pair["differ"],
             "layout_dependent": pair["layout_dependent"], "undefined": pair["undefined"], "returns": report["returns"],
             "distinct_behaviors": report["distinct_behaviors"]["a"],
-            "first_difference": pair["examples"][0] if pair["examples"] else None}
+            "first_difference": pair["examples"][0] if pair["examples"] else None,
+            "execution_limits": report["execution_limits"], "budget_retries": report["budget_retries"]}
     print(json.dumps(line))
     return 0 if pair["differ"] == 0 else 1
 
@@ -62,7 +63,8 @@ def cmd_batch(args):
                      f" ({v[key]} {key.replace('_', '-')})" for key in ("layout_dependent", "undefined") if v[key])
                  for k, v in report["comparison"].items()}
         print(json.dumps({"address": address, "symbol": symbol, "outcomes": report["outcomes"][next(iter(versions))],
-                          "pairs": pairs, "examples": {k: v["examples"][:1] for k, v in report["comparison"].items()}}))
+                          "pairs": pairs, "execution_limits": report["execution_limits"],
+                          "budget_retries": report["budget_retries"], "examples": {k: v["examples"][:1] for k, v in report["comparison"].items()}}))
         if any(v["differ"] for v in report["comparison"].values()):
             status = 1
     return status
