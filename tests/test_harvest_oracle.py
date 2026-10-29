@@ -434,6 +434,14 @@ extern "C" int existing() {
         self.assertEqual(oracle.case_differences(a, b, [], [], {}, {}, {}, "none", first_only=True),
                          ["outcome return vs crash"])
 
+    def test_workers_leave_a_gibibyte_of_available_memory_each(self):
+        meminfo = "MemTotal: 33554432 kB\nMemAvailable: 3145728 kB\n"
+        with patch.object(oracle.Path, "read_text", return_value=meminfo), \
+                patch.object(oracle.os, "sched_getaffinity", return_value=set(range(32))), \
+                patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ORACLE_WORKERS", None)
+            self.assertEqual(oracle.execution_workers(), 3)
+
     def test_reading_records_keeps_no_descriptor_per_run(self):
         # A comparison holds thousands of single-seed reruns at once; one descriptor each exhausts the
         # open-file limit of a service, 1,024 by default.

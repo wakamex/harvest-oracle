@@ -873,11 +873,16 @@ def execute(harvest, elf, entry, slot, spec, cases, own=None, seeds=None, guard_
                          keep_writes=keep_writes, pages=pages)
 
 
+# Measured peak per worker on CSpritePackage::load and IGUIStaticText::breakText: 6.45 GiB across eight
+# workers with their case children, about 0.8 GiB each.
+WORKER_MEMORY_KIB = 1024 * 1024
+
+
 def execution_workers():
-    """Bound concurrent case processes by CPUs and 256 MiB of available memory per lane."""
+    """Bound concurrent case processes by CPUs and one GiB of available memory per lane."""
     cores = len(os.sched_getaffinity(0))
     available = int(Path("/proc/meminfo").read_text().split("MemAvailable:")[1].split()[0])
-    return max(1, min(8, cores, available // (256 * 1024), int(os.environ.get("ORACLE_WORKERS", "8"))))
+    return max(1, min(8, cores, available // WORKER_MEMORY_KIB, int(os.environ.get("ORACLE_WORKERS", "8"))))
 
 
 def execute_range(harvest, elf, entry, slot, spec, cases, own=None, first=1, guard_list="", plan=None, binary=True,
